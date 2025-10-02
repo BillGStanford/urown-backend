@@ -138,8 +138,10 @@ app.use('/api', generalLimiter);
 app.use('/api/user', authLimiter);
 
 // Database initialization
+// Database initialization
 const initDatabase = async () => {
   try {
+    // Create users table first (no dependencies)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -168,7 +170,20 @@ const initDatabase = async () => {
         CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
       )
     `);
-    
+
+    // Create debate_topics table (referenced by articles)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS debate_topics (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        description TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP NOT NULL,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+      )
+    `);
+
+    // Create articles table (references debate_topics)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS articles (
         id SERIAL PRIMARY KEY,
@@ -185,98 +200,6 @@ const initDatabase = async () => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-
-    // Add the featured column if it doesn't exist
-    try {
-      await pool.query(`
-        ALTER TABLE articles 
-        ADD COLUMN IF NOT EXISTS featured BOOLEAN DEFAULT FALSE
-      `);
-    } catch (alterError) {
-      // Column might already exist, which is fine
-      console.log('Featured column already exists or could not be added:', alterError.message);
-    }
-
-    // Add the views column if it doesn't exist
-    try {
-      await pool.query(`
-        ALTER TABLE articles 
-        ADD COLUMN IF NOT EXISTS views INTEGER DEFAULT 0
-      `);
-    } catch (alterError) {
-      // Column might already exist, which is fine
-      console.log('Views column already exists or could not be added:', alterError.message);
-    }
-
-    // Add parent_article_id column if it doesn't exist
-    try {
-      await pool.query(`
-        ALTER TABLE articles 
-        ADD COLUMN IF NOT EXISTS parent_article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE
-      `);
-    } catch (alterError) {
-      console.log('parent_article_id column already exists or could not be added:', alterError.message);
-    }
-
-    // Add debate_topic_id column if it doesn't exist
-    try {
-      await pool.query(`
-        ALTER TABLE articles 
-        ADD COLUMN IF NOT EXISTS debate_topic_id INTEGER
-      `);
-    } catch (alterError) {
-      console.log('debate_topic_id column already exists or could not be added:', alterError.message);
-    }
-
-    // Add is_debate_winner column if it doesn't exist
-    try {
-      await pool.query(`
-        ALTER TABLE articles 
-        ADD COLUMN IF NOT EXISTS is_debate_winner BOOLEAN DEFAULT FALSE
-      `);
-    } catch (alterError) {
-      console.log('is_debate_winner column already exists or could not be added:', alterError.message);
-    }
-
-    // Add update tracking columns if they don't exist
-    try {
-      await pool.query(`
-        ALTER TABLE users 
-        ADD COLUMN IF NOT EXISTS display_name_updated_at TIMESTAMP,
-        ADD COLUMN IF NOT EXISTS email_updated_at TIMESTAMP,
-        ADD COLUMN IF NOT EXISTS phone_updated_at TIMESTAMP,
-        ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMP
-      `);
-    } catch (alterError) {
-      console.log('Update tracking columns already exist or could not be added:', alterError.message);
-    }
-
-    // Add account status columns if they don't exist
-    try {
-      await pool.query(`
-        ALTER TABLE users 
-        ADD COLUMN IF NOT EXISTS account_status VARCHAR(20) DEFAULT 'active',
-        ADD COLUMN IF NOT EXISTS soft_deleted_at TIMESTAMP,
-        ADD COLUMN IF NOT EXISTS hard_deleted_at TIMESTAMP,
-        ADD COLUMN IF NOT EXISTS deletion_reason TEXT
-      `);
-    } catch (alterError) {
-      console.log('Account status columns already exist or could not be added:', alterError.message);
-    }
-
-    // Change articles foreign key to set null on delete
-    try {
-      await pool.query(`
-        ALTER TABLE articles 
-        DROP CONSTRAINT IF EXISTS articles_user_id_fkey,
-        ADD CONSTRAINT articles_user_id_fkey 
-        FOREIGN KEY (user_id) 
-        REFERENCES users(id) 
-        ON DELETE SET NULL
-      `);
-    } catch (alterError) {
-      console.log('Articles foreign key constraint already updated or could not be changed:', alterError.message);
-    }
 
     // Create session table
     await pool.query(`
@@ -367,18 +290,6 @@ const initDatabase = async () => {
       )
     `);
 
-    // Create debate_topics table
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS debate_topics (
-        id SERIAL PRIMARY KEY,
-        title VARCHAR(255) NOT NULL,
-        description TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        expires_at TIMESTAMP NOT NULL,
-        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
-      )
-    `);
-
     // Create debate_winners table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS debate_winners (
@@ -406,6 +317,7 @@ const initDatabase = async () => {
     console.log('Database tables initialized successfully');
   } catch (error) {
     console.error('Error initializing database:', error);
+    throw error;
   }
 };
 
