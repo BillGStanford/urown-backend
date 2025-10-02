@@ -21,7 +21,10 @@ let pool;
 if (process.env.DATABASE_URL) {
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: { 
+      rejectUnauthorized: false,
+      sslmode: 'require'
+    }
   });
 } else {
   pool = new Pool({
@@ -30,6 +33,10 @@ if (process.env.DATABASE_URL) {
     database: process.env.DB_NAME,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
+    ssl: { 
+      rejectUnauthorized: false,
+      sslmode: 'require'
+    }
   });
 }
 
