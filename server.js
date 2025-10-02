@@ -2833,9 +2833,18 @@ app.use('/api/*', (req, res) => {
 });
 
 // Start server
+// Start server
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
-  await initDatabase();
+  try {
+    console.log('Initializing database...');
+    await initDatabase();
+    console.log('Database initialization complete. Server is ready.');
+  } catch (error) {
+    console.error('Failed to initialize database:', error);
+    // Continue running even if database initialization fails
+    // The tables might already exist
+  }
 });
 
 module.exports = app;
