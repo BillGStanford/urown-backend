@@ -12,7 +12,6 @@ const session = require('express-session');
 const PgSession = require('connect-pg-simple')(session);
 const path = require('path');
 const fs = require('fs');
-const { JSDOM } = require('jsdom');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -139,6 +138,7 @@ app.use('/api', generalLimiter);
 app.use('/api/user', authLimiter);
 
 // Database initialization
+// Database initialization
 const initDatabase = async () => {
   try {
     // Create users table first (no dependencies)
@@ -197,11 +197,7 @@ const initDatabase = async () => {
         debate_topic_id INTEGER REFERENCES debate_topics(id) ON DELETE CASCADE,
         is_debate_winner BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        is_ebook BOOLEAN DEFAULT FALSE,
-        ebook_type VARCHAR(20),
-        genre VARCHAR(100),
-        toc JSONB
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
@@ -509,28 +505,6 @@ const validateLogin = [
     next();
   }
 ];
-
-// Helper function to generate table of contents from HTML content
-function generateTOC(content) {
-  try {
-    const toc = [];
-    const dom = new JSDOM(content);
-    const headers = dom.window.document.querySelectorAll('h1, h2, h3, h4, h5, h6');
-    
-    headers.forEach((header, index) => {
-      toc.push({
-        id: `header-${index}`,
-        level: parseInt(header.tagName.substring(1)),
-        text: header.textContent.trim()
-      });
-    });
-    
-    return toc;
-  } catch (error) {
-    console.error('Error generating TOC:', error);
-    return [];
-  }
-}
 
 // Routes
 app.get('/api/health', async (req, res) => {
@@ -1713,7 +1687,7 @@ app.get('/api/user/stats', authenticateToken, async (req, res) => {
 // Create new article
 app.post('/api/articles', authenticateToken, async (req, res) => {
   try {
-    const { title, content, published = false, featured = false, parent_article_id, debate_topic_id, genre } = req.body;
+    const { title, content, published = false, featured = false, parent_article_id, debate_topic_id } = req.body;
     const userId = req.user.userId;
 
     // Validate input
@@ -1724,17 +1698,6 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
     if (title.length > 255) {
       return res.status(400).json({ error: 'Title must be 255 characters or less' });
     }
-
-    // Calculate word count and character count
-    const wordCount = content.trim().split(/\s+/).length;
-    const charCount = content.length;
-    
-    // Determine if it's an e-book and its type
-    const isEbook = wordCount > 5000;
-    const ebookType = isEbook ? (charCount > 20000 ? 'full' : 'mini') : null;
-    
-    // Generate table of contents from headers
-    const toc = generateTOC(content);
 
     // If this is a counter opinion, validate the parent article
     if (parent_article_id) {
@@ -1785,7 +1748,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
     // Check weekly limit only if publishing an original article (not a counter opinion or debate opinion)
     if (published && !parent_article_id && !debate_topic_id) {
       const userResult = await pool.query(
-        'SELECT weekly_articles_count, tier FROM users WHERE id = $1',
+        'SELECT weekly_articles_count, weekly_reset_date, tier FROM users WHERE id = $1',
         [userId]
       );
       
@@ -1799,8 +1762,8 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
 
     // Create article
     const result = await pool.query(
-      'INSERT INTO articles (user_id, title, content, published, featured, parent_article_id, debate_topic_id, is_ebook, ebook_type, genre, toc) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *',
-      [userId, title.trim(), content.trim(), published, featured, parent_article_id || null, debate_topic_id || null, isEbook, ebookType, genre || null, toc]
+      'INSERT INTO articles (user_id, title, content, published, featured, parent_article_id, debate_topic_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [userId, title.trim(), content.trim(), published, featured, parent_article_id || null, debate_topic_id || null]
     );
 
     const article = result.rows[0];
@@ -1861,7 +1824,7 @@ app.get('/api/articles', async (req, res) => {
     let query = `
       SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
              u.display_name, u.tier,
-             a.featured, ec.certified, a.is_debate_winner, a.is_ebook, a.ebook_type, a.genre
+             a.featured, ec.certified, a.is_debate_winner
       FROM articles a
       JOIN users u ON a.user_id = u.id
       LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
@@ -1905,7 +1868,7 @@ app.get('/api/user/articles', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT a.id, a.title, a.content, a.published, a.featured, a.views, a.created_at, a.updated_at, a.parent_article_id, a.debate_topic_id,
-              ec.certified, a.is_ebook, a.ebook_type, a.genre
+              ec.certified
        FROM articles a
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
        WHERE a.user_id = $1 
@@ -1928,7 +1891,7 @@ app.get('/api/articles/:id', async (req, res) => {
     // First, get the article to check if it's published and who owns it
     const articleResult = await pool.query(
       `SELECT a.id, a.title, a.content, a.published, a.featured, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
-              u.display_name, u.tier, ec.certified, a.is_ebook, a.ebook_type, a.genre, a.toc
+              u.display_name, u.tier, ec.certified
        FROM articles a
        JOIN users u ON a.user_id = u.id
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
@@ -1997,7 +1960,7 @@ app.get('/api/articles/:id', async (req, res) => {
 app.put('/api/articles/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, content, published, featured, genre } = req.body;
+    const { title, content, published, featured } = req.body;
     const userId = req.user.userId;
 
     // Check if user owns the article
@@ -2018,17 +1981,6 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
     const isCounterOpinion = ownerCheck.rows[0].parent_article_id !== null;
     const isDebateOpinion = ownerCheck.rows[0].debate_topic_id !== null;
 
-    // Calculate word count and character count
-    const wordCount = content.trim().split(/\s+/).length;
-    const charCount = content.length;
-    
-    // Determine if it's an e-book and its type
-    const isEbook = wordCount > 5000;
-    const ebookType = isEbook ? (charCount > 20000 ? 'full' : 'mini') : null;
-    
-    // Generate table of contents from headers
-    const toc = generateTOC(content);
-
     // Check weekly limit only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
     if (published && !currentlyPublished && !isCounterOpinion && !isDebateOpinion) {
       const userResult = await pool.query(
@@ -2047,10 +1999,10 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
     // Update article
     const result = await pool.query(
       `UPDATE articles 
-       SET title = $1, content = $2, published = $3, featured = $4, updated_at = CURRENT_TIMESTAMP, is_ebook = $5, ebook_type = $6, genre = $7, toc = $8
-       WHERE id = $9 
+       SET title = $1, content = $2, published = $3, featured = $4, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $5 
        RETURNING *`,
-      [title?.trim(), content?.trim(), published, featured, isEbook, ebookType, genre || null, toc, id]
+      [title?.trim(), content?.trim(), published, featured, id]
     );
 
     // Update weekly count only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
@@ -2102,69 +2054,6 @@ app.delete('/api/articles/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// E-book endpoints
-
-// Get all e-books
-app.get('/api/ebooks', async (req, res) => {
-  try {
-    const { genre, type, limit = 20, offset = 0 } = req.query;
-    
-    let query = `
-      SELECT a.id, a.title, a.genre, a.ebook_type, a.created_at, a.updated_at,
-             u.display_name, u.tier
-      FROM articles a
-      JOIN users u ON a.user_id = u.id
-      WHERE a.published = true AND a.is_ebook = true
-    `;
-    
-    const params = [];
-    
-    if (genre) {
-      query += ' AND a.genre = $' + (params.length + 1);
-      params.push(genre);
-    }
-    
-    if (type) {
-      query += ' AND a.ebook_type = $' + (params.length + 1);
-      params.push(type);
-    }
-    
-    query += ' ORDER BY a.created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
-    params.push(parseInt(limit), parseInt(offset));
-
-    const result = await pool.query(query, params);
-    
-    res.json({ ebooks: result.rows });
-  } catch (error) {
-    console.error('Get e-books error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get a single e-book with TOC
-app.get('/api/ebooks/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    const result = await pool.query(
-      `SELECT a.*, u.display_name, u.tier
-       FROM articles a
-       JOIN users u ON a.user_id = u.id
-       WHERE a.id = $1 AND a.published = true AND a.is_ebook = true`,
-      [id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'E-book not found' });
-    }
-
-    res.json({ ebook: result.rows[0] });
-  } catch (error) {
-    console.error('Get e-book error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
 // Editorial board routes
 
 // Get articles for editorial board (editorial board, admin, and super-admin only)
@@ -2173,7 +2062,7 @@ app.get('/api/editorial/articles', authenticateEditorialBoard, async (req, res) 
     const result = await pool.query(
       `SELECT a.id, a.title, a.content, a.published, a.featured, a.views, a.created_at, a.updated_at, a.parent_article_id, a.debate_topic_id,
               u.id as user_id, u.display_name, u.tier, u.role,
-              ec.certified, dt.title as debate_topic_title, a.is_debate_winner, a.is_ebook, a.ebook_type, a.genre
+              ec.certified, dt.title as debate_topic_title, a.is_debate_winner
        FROM articles a
        JOIN users u ON a.user_id = u.id
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
@@ -2394,7 +2283,7 @@ app.get('/api/admin/articles', authenticateEditorialBoard, async (req, res) => {
     const result = await pool.query(
       `SELECT a.id, a.title, a.content, a.published, a.featured, a.views, a.created_at, a.updated_at, a.parent_article_id, a.debate_topic_id,
               u.id as user_id, u.display_name, u.tier, u.role,
-              ec.certified, a.is_ebook, a.ebook_type, a.genre
+              ec.certified
        FROM articles a
        JOIN users u ON a.user_id = u.id
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
@@ -2492,7 +2381,6 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
          COUNT(*) as total_articles,
          COUNT(CASE WHEN published = true THEN 1 END) as published_articles,
          COUNT(CASE WHEN published = false THEN 1 END) as draft_articles,
-         COUNT(CASE WHEN is_ebook = true THEN 1 END) as ebook_articles,
          COUNT(CASE WHEN certified = true THEN 1 END) as certified_articles
        FROM articles a
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id`
@@ -2863,6 +2751,7 @@ app.use('/api/*', (req, res) => {
   res.status(404).json({ error: 'API route not found' });
 });
 
+// Start server
 // Start server
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
