@@ -142,34 +142,33 @@ app.use('/api/user', authLimiter);
 const initDatabase = async () => {
   try {
     // Create users table first (no dependencies)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) UNIQUE,
-        phone VARCHAR(20),
-        full_name VARCHAR(255) NOT NULL,
-        display_name VARCHAR(100) NOT NULL UNIQUE,
-        date_of_birth DATE NOT NULL,
-        password_hash VARCHAR(255) NOT NULL,
-        tier VARCHAR(20) DEFAULT 'Silver',
-        weekly_articles_count INTEGER DEFAULT 0,
-        weekly_reset_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        terms_agreed BOOLEAN DEFAULT FALSE,
-        role VARCHAR(20) DEFAULT 'user',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        display_name_updated_at TIMESTAMP,
-        email_updated_at TIMESTAMP,
-        phone_updated_at TIMESTAMP,
-        password_updated_at TIMESTAMP,
-        account_status VARCHAR(20) DEFAULT 'active',
-        soft_deleted_at TIMESTAMP,
-        hard_deleted_at TIMESTAMP,
-        deletion_reason TEXT,
-        CONSTRAINT email_or_phone_required CHECK (email IS NOT NULL OR phone IS NOT NULL),
-        CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
-      )
-    `);
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    phone VARCHAR(20),
+    full_name VARCHAR(255) NOT NULL,
+    display_name VARCHAR(100) NOT NULL UNIQUE,
+    date_of_birth DATE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    tier VARCHAR(20) DEFAULT 'Silver',
+    weekly_articles_count INTEGER DEFAULT 0,
+    weekly_reset_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    terms_agreed BOOLEAN DEFAULT FALSE,
+    role VARCHAR(20) DEFAULT 'user',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    display_name_updated_at TIMESTAMP,
+    email_updated_at TIMESTAMP,
+    phone_updated_at TIMESTAMP,
+    password_updated_at TIMESTAMP,
+    account_status VARCHAR(20) DEFAULT 'active',
+    soft_deleted_at TIMESTAMP,
+    hard_deleted_at TIMESTAMP,
+    deletion_reason TEXT,
+    CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
+  )
+`);
 
     // Create debate_topics table (referenced by articles)
     await pool.query(`
@@ -474,18 +473,15 @@ const logAdminAction = async (adminId, action, targetType, targetId, details = n
 
 // Validation middleware
 const validateSignup = [
-  body('email').optional().isEmail().normalizeEmail(),
-  body('phone').optional().isMobilePhone(),
-  body('full_name').isLength({ min: 2, max: 255 }).trim(),
-  body('display_name').isLength({ min: 2, max: 100 }).trim(),
-  body('date_of_birth').isDate(),
-  body('password').isLength({ min: 8 }).matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/),
-  body('terms_agreed').equals('true'),
+  body('email').isEmail().normalizeEmail().withMessage('Valid email is required'),
+  body('phone').optional().isMobilePhone().withMessage('Invalid phone number format'),
+  body('full_name').isLength({ min: 2, max: 255 }).trim().withMessage('Full name must be 2-255 characters'),
+  body('display_name').isLength({ min: 2, max: 100 }).trim().withMessage('Display name must be 2-100 characters'),
+  body('date_of_birth').isDate().withMessage('Valid date of birth is required'),
+  body('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters')
+    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/).withMessage('Password must contain uppercase, lowercase, and number'),
+  body('terms_agreed').equals('true').withMessage('You must agree to the terms of service'),
   (req, res, next) => {
-    if (!req.body.email && !req.body.phone) {
-      return res.status(400).json({ error: 'Either email or phone number is required' });
-    }
-    
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({ error: 'Validation failed', details: errors.array() });
@@ -1215,7 +1211,7 @@ app.post('/api/auth/signup', validateSignup, async (req, res) => {
       return res.status(400).json({ error: 'You must be at least 15 years old to register' });
     }
 
-    // Check if email or display_name already exists
+    // Check if email already exists (email is now required)
     const existingUser = await pool.query(
       'SELECT id FROM users WHERE email = $1 OR display_name = $2',
       [email, display_name]
@@ -1229,12 +1225,12 @@ app.post('/api/auth/signup', validateSignup, async (req, res) => {
     const saltRounds = 12;
     const password_hash = await bcrypt.hash(password, saltRounds);
 
-    // Create user
+    // Create user (phone is now optional)
     const result = await pool.query(
       `INSERT INTO users (email, phone, full_name, display_name, date_of_birth, password_hash, terms_agreed)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING id, email, phone, full_name, display_name, tier, role, created_at`,
-      [email, phone, full_name, display_name, date_of_birth, password_hash, terms_agreed]
+      [email, phone || null, full_name, display_name, date_of_birth, password_hash, terms_agreed]
     );
 
     const user = result.rows[0];
@@ -1268,6 +1264,7 @@ app.post('/api/auth/signup', validateSignup, async (req, res) => {
 });
 
 // Login
+// server.js - Update the login route
 app.post('/api/auth/login', validateLogin, async (req, res) => {
   try {
     const { identifier, password } = req.body;
