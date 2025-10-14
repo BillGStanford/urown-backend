@@ -471,20 +471,26 @@ const logAdminAction = async (adminId, action, targetType, targetId, details = n
   }
 };
 
-// Validation middleware
+// server.js - Update the validateSignup middleware
 const validateSignup = [
-  body('email').isEmail().normalizeEmail().withMessage('Valid email is required'),
-  body('phone').optional().isMobilePhone().withMessage('Invalid phone number format'),
-  body('full_name').isLength({ min: 2, max: 255 }).trim().withMessage('Full name must be 2-255 characters'),
-  body('display_name').isLength({ min: 2, max: 100 }).trim().withMessage('Display name must be 2-100 characters'),
-  body('date_of_birth').isDate().withMessage('Valid date of birth is required'),
+  body('email').notEmpty().withMessage('Email is required')
+    .isEmail().normalizeEmail().withMessage('Please enter a valid email address'),
+  body('phone').optional({ checkFalsy: true }).isMobilePhone('any').withMessage('Please enter a valid phone number'),
+  body('full_name').isLength({ min: 2, max: 255 }).trim().withMessage('Full name must be at least 2 characters'),
+  body('display_name').isLength({ min: 2, max: 100 }).trim().withMessage('Display name must be at least 2 characters'),
+  body('date_of_birth').isISO8601().toDate().withMessage('Please enter a valid date of birth'),
   body('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters')
     .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/).withMessage('Password must contain uppercase, lowercase, and number'),
   body('terms_agreed').equals('true').withMessage('You must agree to the terms of service'),
   (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ error: 'Validation failed', details: errors.array() });
+      // Return more detailed error information
+      const errorMessages = errors.array().map(error => error.msg);
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errorMessages 
+      });
     }
     next();
   }
@@ -1198,20 +1204,69 @@ app.delete('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
 });
 
 // Signup
-app.post('/api/auth/signup', validateSignup, async (req, res) => {
+// server.js - Update the signup route
+app.post('/api/auth/signup', async (req, res) => {
   try {
     const { email, phone, full_name, display_name, date_of_birth, password, terms_agreed } = req.body;
     
-    // Check age requirement
-    const birthDate = new Date(date_of_birth);
-    const today = new Date();
-    const age = Math.floor((today - birthDate) / (365.25 * 24 * 60 * 60 * 1000));
+    // Manual validation for better error messages
+    const errors = {};
     
-    if (age < 15) {
-      return res.status(400).json({ error: 'You must be at least 15 years old to register' });
+    // Email validation
+    if (!email) {
+      errors.email = 'Email is required';
+    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      errors.email = 'Please enter a valid email address';
     }
-
-    // Check if email already exists (email is now required)
+    
+    // Phone validation (optional)
+    if (phone && !/^\+?[1-9]\d{1,14}$/.test(phone.replace(/\s/g, ''))) {
+      errors.phone = 'Please enter a valid phone number';
+    }
+    
+    // Full name validation
+    if (!full_name || full_name.trim().length < 2) {
+      errors.full_name = 'Full name must be at least 2 characters';
+    }
+    
+    // Display name validation
+    if (!display_name || display_name.trim().length < 2) {
+      errors.display_name = 'Display name must be at least 2 characters';
+    }
+    
+    // Date of birth validation
+    if (!date_of_birth) {
+      errors.date_of_birth = 'Date of birth is required';
+    } else {
+      const birthDate = new Date(date_of_birth);
+      const today = new Date();
+      const age = Math.floor((today - birthDate) / (365.25 * 24 * 60 * 60 * 1000));
+      if (age < 15) {
+        errors.date_of_birth = 'You must be at least 15 years old to register';
+      }
+    }
+    
+    // Password validation
+    if (!password || password.length < 8) {
+      errors.password = 'Password must be at least 8 characters';
+    } else if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(password)) {
+      errors.password = 'Password must contain uppercase, lowercase, and number';
+    }
+    
+    // Terms validation
+    if (terms_agreed !== true) {
+      errors.terms_agreed = 'You must agree to the terms of service';
+    }
+    
+    // If there are validation errors, return them
+    if (Object.keys(errors).length > 0) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: errors 
+      });
+    }
+    
+    // Check if email already exists
     const existingUser = await pool.query(
       'SELECT id FROM users WHERE email = $1 OR display_name = $2',
       [email, display_name]
