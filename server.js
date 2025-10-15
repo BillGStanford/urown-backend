@@ -1203,7 +1203,7 @@ app.delete('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
 });
 
 // Signup
-// server.js - Update the signup route
+// In server.js, update the signup route
 app.post('/api/auth/signup', async (req, res) => {
   try {
     const { email, phone, full_name, display_name, date_of_birth, password, terms_agreed } = req.body;
@@ -1313,7 +1313,11 @@ app.post('/api/auth/signup', async (req, res) => {
 
   } catch (error) {
     console.error('Signup error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    // Return more detailed error information
+    res.status(500).json({ 
+      error: 'Internal server error', 
+      details: error.message || 'An unknown error occurred during registration' 
+    });
   }
 });
 
