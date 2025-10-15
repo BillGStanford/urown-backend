@@ -14,6 +14,28 @@ async function migrate() {
   console.log('Running database migrations...');
 
   try {
+    // FIX: Modify full_name column to allow NULL values
+    try {
+      // First check if the column exists and its constraints
+      const columnCheck = await pool.query(`
+        SELECT column_name, is_nullable 
+        FROM information_schema.columns 
+        WHERE table_name = 'users' AND column_name = 'full_name'
+      `);
+      
+      if (columnCheck.rows.length > 0 && columnCheck.rows[0].is_nullable === 'NO') {
+        // If the column exists but doesn't allow NULL, alter it
+        await pool.query(`
+          ALTER TABLE users ALTER COLUMN full_name DROP NOT NULL
+        `);
+        console.log('Modified full_name column to allow NULL values');
+      } else {
+        console.log('full_name column already allows NULL values or does not exist');
+      }
+    } catch (error) {
+      console.log('Error modifying full_name column:', error.message);
+    }
+
     // Add role column to users table if it doesn't exist
     try {
       await pool.query(`

@@ -165,7 +165,7 @@ const initDatabase = async () => {
         id SERIAL PRIMARY KEY,
         email VARCHAR(255) UNIQUE NOT NULL,
         phone VARCHAR(20),
-        full_name VARCHAR(255), -- Changed from NOT NULL to allow NULL values
+        full_name VARCHAR(255), -- Now allows NULL values after migration
         display_name VARCHAR(100) NOT NULL UNIQUE,
         date_of_birth DATE NOT NULL,
         password_hash VARCHAR(255) NOT NULL,
@@ -2825,7 +2825,6 @@ app.use('/api/*', (req, res) => {
   res.status(404).json({ error: 'API route not found' });
 });
 
-// Start server
 // Start server
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
