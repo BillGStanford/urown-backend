@@ -138,37 +138,36 @@ app.use('/api', generalLimiter);
 app.use('/api/user', authLimiter);
 
 // Database initialization
-// Database initialization
 const initDatabase = async () => {
   try {
     // Create users table first (no dependencies)
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    phone VARCHAR(20),
-    full_name VARCHAR(255) NOT NULL,
-    display_name VARCHAR(100) NOT NULL UNIQUE,
-    date_of_birth DATE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    tier VARCHAR(20) DEFAULT 'Silver',
-    weekly_articles_count INTEGER DEFAULT 0,
-    weekly_reset_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    terms_agreed BOOLEAN DEFAULT FALSE,
-    role VARCHAR(20) DEFAULT 'user',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    display_name_updated_at TIMESTAMP,
-    email_updated_at TIMESTAMP,
-    phone_updated_at TIMESTAMP,
-    password_updated_at TIMESTAMP,
-    account_status VARCHAR(20) DEFAULT 'active',
-    soft_deleted_at TIMESTAMP,
-    hard_deleted_at TIMESTAMP,
-    deletion_reason TEXT,
-    CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
-  )
-`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        phone VARCHAR(20),
+        full_name VARCHAR(255), -- Changed from NOT NULL to allow NULL values
+        display_name VARCHAR(100) NOT NULL UNIQUE,
+        date_of_birth DATE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        tier VARCHAR(20) DEFAULT 'Silver',
+        weekly_articles_count INTEGER DEFAULT 0,
+        weekly_reset_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        terms_agreed BOOLEAN DEFAULT FALSE,
+        role VARCHAR(20) DEFAULT 'user',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        display_name_updated_at TIMESTAMP,
+        email_updated_at TIMESTAMP,
+        phone_updated_at TIMESTAMP,
+        password_updated_at TIMESTAMP,
+        account_status VARCHAR(20) DEFAULT 'active',
+        soft_deleted_at TIMESTAMP,
+        hard_deleted_at TIMESTAMP,
+        deletion_reason TEXT,
+        CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
+      )
+    `);
 
     // Create debate_topics table (referenced by articles)
     await pool.query(`
@@ -1224,8 +1223,8 @@ app.post('/api/auth/signup', async (req, res) => {
       errors.phone = 'Please enter a valid phone number';
     }
     
-    // Full name validation
-    if (!full_name || full_name.trim().length < 2) {
+    // Full name validation (now optional)
+    if (full_name && full_name.trim().length > 0 && full_name.trim().length < 2) {
       errors.full_name = 'Full name must be at least 2 characters';
     }
     
@@ -1280,12 +1279,12 @@ app.post('/api/auth/signup', async (req, res) => {
     const saltRounds = 12;
     const password_hash = await bcrypt.hash(password, saltRounds);
 
-    // Create user (phone is now optional)
+    // Create user (phone and full_name are now optional)
     const result = await pool.query(
       `INSERT INTO users (email, phone, full_name, display_name, date_of_birth, password_hash, terms_agreed)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING id, email, phone, full_name, display_name, tier, role, created_at`,
-      [email, phone || null, full_name, display_name, date_of_birth, password_hash, terms_agreed]
+      [email, phone || null, full_name || null, display_name, date_of_birth, password_hash, terms_agreed]
     );
 
     const user = result.rows[0];
