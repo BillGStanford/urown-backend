@@ -139,7 +139,26 @@ app.use('/api/user', authLimiter);
 
 // Database initialization
 const initDatabase = async () => {
-  try {
+    try {
+    // Check if the full_name column needs to be modified
+    try {
+      // First check if the column exists and its constraints
+      const columnCheck = await pool.query(`
+        SELECT column_name, is_nullable 
+        FROM information_schema.columns 
+        WHERE table_name = 'users' AND column_name = 'full_name'
+      `);
+      
+      if (columnCheck.rows.length > 0 && columnCheck.rows[0].is_nullable === 'NO') {
+        // If the column exists but doesn't allow NULL, alter it
+        await pool.query(`
+          ALTER TABLE users ALTER COLUMN full_name DROP NOT NULL
+        `);
+        console.log('Modified full_name column to allow NULL values');
+      }
+    } catch (alterError) {
+      console.log('Could not alter full_name column:', alterError.message);
+    }
     // Create users table first (no dependencies)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
