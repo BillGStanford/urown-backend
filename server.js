@@ -43,7 +43,7 @@ if (process.env.DATABASE_URL) {
 // Middleware
 app.use(helmet());
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'https://urown-delta.vercel.app', // Use your Vercel URL
+  origin: process.env.FRONTEND_URL || 'https://urown-delta.vercel.app',
   credentials: true
 }));
 app.use(express.json({ limit: '10mb' }));
@@ -139,7 +139,7 @@ app.use('/api/user', authLimiter);
 
 // Database initialization
 const initDatabase = async () => {
-    try {
+  try {
     // Check if the full_name column needs to be modified
     try {
       // First check if the column exists and its constraints
@@ -159,13 +159,14 @@ const initDatabase = async () => {
     } catch (alterError) {
       console.log('Could not alter full_name column:', alterError.message);
     }
+    
     // Create users table first (no dependencies)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         email VARCHAR(255) UNIQUE NOT NULL,
         phone VARCHAR(20),
-        full_name VARCHAR(255), -- Now allows NULL values after migration
+        full_name VARCHAR(255),
         display_name VARCHAR(100) NOT NULL UNIQUE,
         date_of_birth DATE NOT NULL,
         password_hash VARCHAR(255) NOT NULL,
@@ -185,6 +186,24 @@ const initDatabase = async () => {
         hard_deleted_at TIMESTAMP,
         deletion_reason TEXT,
         CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
+      )
+    `);
+
+    // Create topics table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS topics (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(50) UNIQUE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create article_topics junction table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS article_topics (
+        article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
+        topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+        PRIMARY KEY (article_id, topic_id)
       )
     `);
 
@@ -319,39 +338,19 @@ const initDatabase = async () => {
       )
     `);
 
-    // Add these table creations to your initDatabase function in server.js
+    // Insert default topics if they don't exist
+    const defaultTopics = [
+      'Politics', 'Business', 'Finance', 'Sports', 'Food', 'Travel',
+      'Technology', 'Health', 'Entertainment', 'Science', 'Environment'
+    ];
 
-// Create topics table
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS topics (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(50) UNIQUE NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-
-// Create article_topics junction table
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS article_topics (
-    article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
-    topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
-    PRIMARY KEY (article_id, topic_id)
-  )
-`);
-
-// Insert default topics if they don't exist
-const defaultTopics = [
-  'Politics', 'Business', 'Finance', 'Sports', 'Food', 'Travel',
-  'Technology', 'Health', 'Entertainment', 'Science', 'Environment'
-];
-
-for (const topic of defaultTopics) {
-  await pool.query(`
-    INSERT INTO topics (name) 
-    VALUES ($1) 
-    ON CONFLICT (name) DO NOTHING
-  `, [topic]);
-}
+    for (const topic of defaultTopics) {
+      await pool.query(`
+        INSERT INTO topics (name) 
+        VALUES ($1) 
+        ON CONFLICT (name) DO NOTHING
+      `, [topic]);
+    }
 
     // Set super-admin for the specified user
     try {
@@ -568,6 +567,17 @@ app.get('/api/health', async (req, res) => {
   } catch (error) {
     console.error('Database connection error:', error);
     res.status(500).json({ status: 'ERROR', message: 'Database connection failed' });
+  }
+});
+
+// Get all available topics
+app.get('/api/topics', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM topics ORDER BY name');
+    res.json({ topics: result.rows });
+  } catch (error) {
+    console.error('Get topics error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1795,7 +1805,7 @@ app.get('/api/user/stats', authenticateToken, async (req, res) => {
 // Create new article
 app.post('/api/articles', authenticateToken, async (req, res) => {
   try {
-    const { title, content, published = false, featured = false, parent_article_id, debate_topic_id } = req.body;
+    const { title, content, published = false, featured = false, parent_article_id, debate_topic_id, topicIds = [] } = req.body;
     const userId = req.user.userId;
 
     // Validate input
@@ -1805,6 +1815,23 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
 
     if (title.length > 255) {
       return res.status(400).json({ error: 'Title must be 255 characters or less' });
+    }
+
+    // Validate topic selection (max 3 topics)
+    if (topicIds.length > 3) {
+      return res.status(400).json({ error: 'You can select a maximum of 3 topics' });
+    }
+
+    // Validate that all topic IDs exist
+    if (topicIds.length > 0) {
+      const topicCheck = await pool.query(
+        'SELECT id FROM topics WHERE id = ANY($1)',
+        [topicIds]
+      );
+      
+      if (topicCheck.rows.length !== topicIds.length) {
+        return res.status(400).json({ error: 'One or more selected topics are invalid' });
+      }
     }
 
     // If this is a counter opinion, validate the parent article
@@ -1876,6 +1903,14 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
 
     const article = result.rows[0];
 
+    // Link article with topics if provided
+    if (topicIds.length > 0) {
+      const topicValues = topicIds.map(topicId => `(${article.id}, ${topicId})`).join(', ');
+      await pool.query(
+        `INSERT INTO article_topics (article_id, topic_id) VALUES ${topicValues}`
+      );
+    }
+
     // Update weekly count only if publishing an original article (not a counter opinion or debate opinion)
     if (published && !parent_article_id && !debate_topic_id) {
       await pool.query(
@@ -1927,15 +1962,21 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
 // Get all published articles (for browse and homepage)
 app.get('/api/articles', async (req, res) => {
   try {
-    const { featured, limit = 20, offset = 0, parent_article_id, debate_topic_id } = req.query;
+    const { featured, limit = 20, offset = 0, parent_article_id, debate_topic_id, topicId } = req.query;
     
     let query = `
       SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
              u.display_name, u.tier,
-             a.featured, ec.certified, a.is_debate_winner
+             a.featured, ec.certified, a.is_debate_winner,
+             COALESCE(
+               ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+               ARRAY[]::VARCHAR[]
+             ) as topics
       FROM articles a
       JOIN users u ON a.user_id = u.id
       LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
+      LEFT JOIN article_topics at ON a.id = at.article_id
+      LEFT JOIN topics t ON at.topic_id = t.id
       WHERE a.published = true
     `;
     
@@ -1959,7 +2000,12 @@ app.get('/api/articles', async (req, res) => {
       params.push(parent_article_id);
     }
     
-    query += ' ORDER BY a.created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
+    if (topicId) {
+      query += ' AND EXISTS (SELECT 1 FROM article_topics WHERE article_id = a.id AND topic_id = $' + (params.length + 1) + ')';
+      params.push(topicId);
+    }
+    
+    query += ' GROUP BY a.id, u.display_name, u.tier, ec.certified ORDER BY a.created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
     params.push(parseInt(limit), parseInt(offset));
 
     const result = await pool.query(query, params);
@@ -1976,10 +2022,17 @@ app.get('/api/user/articles', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT a.id, a.title, a.content, a.published, a.featured, a.views, a.created_at, a.updated_at, a.parent_article_id, a.debate_topic_id,
-              ec.certified
+              ec.certified,
+              COALESCE(
+                ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+                ARRAY[]::VARCHAR[]
+              ) as topics
        FROM articles a
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
+       LEFT JOIN article_topics at ON a.id = at.article_id
+       LEFT JOIN topics t ON at.topic_id = t.id
        WHERE a.user_id = $1 
+       GROUP BY a.id, ec.certified
        ORDER BY a.updated_at DESC`,
       [req.user.userId]
     );
@@ -1999,11 +2052,18 @@ app.get('/api/articles/:id', async (req, res) => {
     // First, get the article to check if it's published and who owns it
     const articleResult = await pool.query(
       `SELECT a.id, a.title, a.content, a.published, a.featured, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
-              u.display_name, u.tier, ec.certified
+              u.display_name, u.tier, ec.certified,
+              COALESCE(
+                ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+                ARRAY[]::VARCHAR[]
+              ) as topics
        FROM articles a
        JOIN users u ON a.user_id = u.id
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
-       WHERE a.id = $1`,
+       LEFT JOIN article_topics at ON a.id = at.article_id
+       LEFT JOIN topics t ON at.topic_id = t.id
+       WHERE a.id = $1
+       GROUP BY a.id, u.display_name, u.tier, ec.certified`,
       [id]
     );
 
@@ -2068,7 +2128,7 @@ app.get('/api/articles/:id', async (req, res) => {
 app.put('/api/articles/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, content, published, featured } = req.body;
+    const { title, content, published, featured, topicIds = [] } = req.body;
     const userId = req.user.userId;
 
     // Check if user owns the article
@@ -2088,6 +2148,23 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
     const currentlyPublished = ownerCheck.rows[0].current_published;
     const isCounterOpinion = ownerCheck.rows[0].parent_article_id !== null;
     const isDebateOpinion = ownerCheck.rows[0].debate_topic_id !== null;
+
+    // Validate topic selection (max 3 topics)
+    if (topicIds.length > 3) {
+      return res.status(400).json({ error: 'You can select a maximum of 3 topics' });
+    }
+
+    // Validate that all topic IDs exist
+    if (topicIds.length > 0) {
+      const topicCheck = await pool.query(
+        'SELECT id FROM topics WHERE id = ANY($1)',
+        [topicIds]
+      );
+      
+      if (topicCheck.rows.length !== topicIds.length) {
+        return res.status(400).json({ error: 'One or more selected topics are invalid' });
+      }
+    }
 
     // Check weekly limit only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
     if (published && !currentlyPublished && !isCounterOpinion && !isDebateOpinion) {
@@ -2112,6 +2189,21 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
        RETURNING *`,
       [title?.trim(), content?.trim(), published, featured, id]
     );
+
+    // Update article topics
+    // First, remove all existing topic associations
+    await pool.query(
+      'DELETE FROM article_topics WHERE article_id = $1',
+      [id]
+    );
+
+    // Then, add new topic associations if provided
+    if (topicIds.length > 0) {
+      const topicValues = topicIds.map(topicId => `(${id}, ${topicId})`).join(', ');
+      await pool.query(
+        `INSERT INTO article_topics (article_id, topic_id) VALUES ${topicValues}`
+      );
+    }
 
     // Update weekly count only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
     if (published && !currentlyPublished && !isCounterOpinion && !isDebateOpinion) {
@@ -2170,11 +2262,17 @@ app.get('/api/editorial/articles', authenticateEditorialBoard, async (req, res) 
     const result = await pool.query(
       `SELECT a.id, a.title, a.content, a.published, a.featured, a.views, a.created_at, a.updated_at, a.parent_article_id, a.debate_topic_id,
               u.id as user_id, u.display_name, u.tier, u.role,
-              ec.certified, dt.title as debate_topic_title, a.is_debate_winner
+              ec.certified, dt.title as debate_topic_title, a.is_debate_winner,
+              COALESCE(
+                ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+                ARRAY[]::VARCHAR[]
+              ) as topics
        FROM articles a
        JOIN users u ON a.user_id = u.id
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
        LEFT JOIN debate_topics dt ON a.debate_topic_id = dt.id
+       LEFT JOIN article_topics at ON a.id = at.article_id
+       LEFT JOIN topics t ON at.topic_id = t.id
        ORDER BY a.created_at DESC`
     );
 
@@ -2391,10 +2489,16 @@ app.get('/api/admin/articles', authenticateEditorialBoard, async (req, res) => {
     const result = await pool.query(
       `SELECT a.id, a.title, a.content, a.published, a.featured, a.views, a.created_at, a.updated_at, a.parent_article_id, a.debate_topic_id,
               u.id as user_id, u.display_name, u.tier, u.role,
-              ec.certified
+              ec.certified,
+              COALESCE(
+                ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+                ARRAY[]::VARCHAR[]
+              ) as topics
        FROM articles a
        JOIN users u ON a.user_id = u.id
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
+       LEFT JOIN article_topics at ON a.id = at.article_id
+       LEFT JOIN topics t ON at.topic_id = t.id
        ORDER BY a.created_at DESC`
     );
 
@@ -2829,441 +2933,6 @@ app.delete('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoa
     res.json({ message: 'Winner status removed successfully' });
   } catch (error) {
     console.error('Remove winner status error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Add these routes to your server.js
-
-// Get all available topics
-app.get('/api/topics', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM topics ORDER BY name');
-    res.json({ topics: result.rows });
-  } catch (error) {
-    console.error('Get topics error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update the create article route to handle topics
-app.post('/api/articles', authenticateToken, async (req, res) => {
-  try {
-    const { title, content, published = false, featured = false, parent_article_id, debate_topic_id, topicIds = [] } = req.body;
-    const userId = req.user.userId;
-
-    // Validate input
-    if (!title?.trim() || !content?.trim()) {
-      return res.status(400).json({ error: 'Title and content are required' });
-    }
-
-    if (title.length > 255) {
-      return res.status(400).json({ error: 'Title must be 255 characters or less' });
-    }
-
-    // Validate topic selection (max 3 topics)
-    if (topicIds.length > 3) {
-      return res.status(400).json({ error: 'You can select a maximum of 3 topics' });
-    }
-
-    // Validate that all topic IDs exist
-    if (topicIds.length > 0) {
-      const topicCheck = await pool.query(
-        'SELECT id FROM topics WHERE id = ANY($1)',
-        [topicIds]
-      );
-      
-      if (topicCheck.rows.length !== topicIds.length) {
-        return res.status(400).json({ error: 'One or more selected topics are invalid' });
-      }
-    }
-
-    // If this is a counter opinion, validate the parent article
-    if (parent_article_id) {
-      // Check if parent article exists and is published
-      const parentResult = await pool.query(
-        'SELECT id FROM articles WHERE id = $1 AND published = true',
-        [parent_article_id]
-      );
-
-      if (parentResult.rows.length === 0) {
-        return res.status(400).json({ error: 'Parent article not found or not published' });
-      }
-
-      // Check if parent article already has 5 counter opinions
-      const counterCountResult = await pool.query(
-        'SELECT COUNT(*) as count FROM articles WHERE parent_article_id = $1',
-        [parent_article_id]
-      );
-
-      if (parseInt(counterCountResult.rows[0].count) >= 5) {
-        return res.status(400).json({ error: 'Maximum number of counter opinions reached for this article' });
-      }
-    }
-
-    // If this is a debate opinion, validate the debate topic
-    if (debate_topic_id) {
-      // Check if debate topic exists and is active
-      const topicResult = await pool.query(
-        'SELECT id FROM debate_topics WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP',
-        [debate_topic_id]
-      );
-
-      if (topicResult.rows.length === 0) {
-        return res.status(400).json({ error: 'Debate topic not found or expired' });
-      }
-
-      // Check if user has already written an opinion for this topic
-      const existingOpinion = await pool.query(
-        'SELECT id FROM articles WHERE debate_topic_id = $1 AND user_id = $2',
-        [debate_topic_id, userId]
-      );
-
-      if (existingOpinion.rows.length > 0) {
-        return res.status(400).json({ error: 'You have already written an opinion for this debate topic' });
-      }
-    }
-
-    // Check weekly limit only if publishing an original article (not a counter opinion or debate opinion)
-    if (published && !parent_article_id && !debate_topic_id) {
-      const userResult = await pool.query(
-        'SELECT weekly_articles_count, weekly_reset_date, tier FROM users WHERE id = $1',
-        [userId]
-      );
-      
-      const user = userResult.rows[0];
-      const silverLimit = parseInt(process.env.SILVER_TIER_WEEKLY_LIMIT) || 2;
-      
-      if (user.weekly_articles_count >= silverLimit) {
-        return res.status(400).json({ error: 'Weekly article limit reached' });
-      }
-    }
-
-    // Create article
-    const result = await pool.query(
-      'INSERT INTO articles (user_id, title, content, published, featured, parent_article_id, debate_topic_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-      [userId, title.trim(), content.trim(), published, featured, parent_article_id || null, debate_topic_id || null]
-    );
-
-    const article = result.rows[0];
-
-    // Link article with topics if provided
-    if (topicIds.length > 0) {
-      const topicValues = topicIds.map(topicId => `(${article.id}, ${topicId})`).join(', ');
-      await pool.query(
-        `INSERT INTO article_topics (article_id, topic_id) VALUES ${topicValues}`
-      );
-    }
-
-    // Update weekly count only if publishing an original article (not a counter opinion or debate opinion)
-    if (published && !parent_article_id && !debate_topic_id) {
-      await pool.query(
-        'UPDATE users SET weekly_articles_count = weekly_articles_count + 1 WHERE id = $1',
-        [userId]
-      );
-    }
-
-    // Get updated user data to return to client
-    const updatedUserResult = await pool.query(
-      'SELECT id, email, phone, full_name, display_name, tier, role, weekly_articles_count, weekly_reset_date, display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, created_at FROM users WHERE id = $1',
-      [userId]
-    );
-
-    const updatedUser = updatedUserResult.rows[0];
-
-    // Get updated user statistics
-    const statsResult = await pool.query(
-      `SELECT 
-        COUNT(*) as total_articles,
-        COUNT(CASE WHEN published = true THEN 1 END) as published_articles,
-        COUNT(CASE WHEN published = false THEN 1 END) as draft_articles,
-        COALESCE(SUM(views), 0) as total_views
-       FROM articles 
-       WHERE user_id = $1`,
-      [userId]
-    );
-
-    const stats = {
-      totalArticles: parseInt(statsResult.rows[0].total_articles),
-      publishedArticles: parseInt(statsResult.rows[0].published_articles),
-      draftArticles: parseInt(statsResult.rows[0].draft_articles),
-      views: parseInt(statsResult.rows[0].total_views) || 0
-    };
-
-    res.status(201).json({
-      message: published ? 'Article published successfully' : 'Article saved as draft',
-      article,
-      user: updatedUser,
-      stats
-    });
-
-  } catch (error) {
-    console.error('Create article error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update the update article route to handle topics
-app.put('/api/articles/:id', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { title, content, published, featured, topicIds = [] } = req.body;
-    const userId = req.user.userId;
-
-    // Check if user owns the article
-    const ownerCheck = await pool.query(
-      'SELECT user_id, published as current_published, parent_article_id, debate_topic_id FROM articles WHERE id = $1',
-      [id]
-    );
-
-    if (ownerCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Article not found' });
-    }
-
-    if (ownerCheck.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Not authorized to edit this article' });
-    }
-
-    const currentlyPublished = ownerCheck.rows[0].current_published;
-    const isCounterOpinion = ownerCheck.rows[0].parent_article_id !== null;
-    const isDebateOpinion = ownerCheck.rows[0].debate_topic_id !== null;
-
-    // Validate topic selection (max 3 topics)
-    if (topicIds.length > 3) {
-      return res.status(400).json({ error: 'You can select a maximum of 3 topics' });
-    }
-
-    // Validate that all topic IDs exist
-    if (topicIds.length > 0) {
-      const topicCheck = await pool.query(
-        'SELECT id FROM topics WHERE id = ANY($1)',
-        [topicIds]
-      );
-      
-      if (topicCheck.rows.length !== topicIds.length) {
-        return res.status(400).json({ error: 'One or more selected topics are invalid' });
-      }
-    }
-
-    // Check weekly limit only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
-    if (published && !currentlyPublished && !isCounterOpinion && !isDebateOpinion) {
-      const userResult = await pool.query(
-        'SELECT weekly_articles_count, tier FROM users WHERE id = $1',
-        [userId]
-      );
-      
-      const user = userResult.rows[0];
-      const silverLimit = parseInt(process.env.SILVER_TIER_WEEKLY_LIMIT) || 2;
-      
-      if (user.weekly_articles_count >= silverLimit) {
-        return res.status(400).json({ error: 'Weekly article limit reached' });
-      }
-    }
-
-    // Update article
-    const result = await pool.query(
-      `UPDATE articles 
-       SET title = $1, content = $2, published = $3, featured = $4, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $5 
-       RETURNING *`,
-      [title?.trim(), content?.trim(), published, featured, id]
-    );
-
-    // Update article topics
-    // First, remove all existing topic associations
-    await pool.query(
-      'DELETE FROM article_topics WHERE article_id = $1',
-      [id]
-    );
-
-    // Then, add new topic associations if provided
-    if (topicIds.length > 0) {
-      const topicValues = topicIds.map(topicId => `(${id}, ${topicId})`).join(', ');
-      await pool.query(
-        `INSERT INTO article_topics (article_id, topic_id) VALUES ${topicValues}`
-      );
-    }
-
-    // Update weekly count only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
-    if (published && !currentlyPublished && !isCounterOpinion && !isDebateOpinion) {
-      await pool.query(
-        'UPDATE users SET weekly_articles_count = weekly_articles_count + 1 WHERE id = $1',
-        [userId]
-      );
-    }
-
-    res.json({
-      message: 'Article updated successfully',
-      article: result.rows[0]
-    });
-
-  } catch (error) {
-    console.error('Update article error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update the get all articles route to include topics
-app.get('/api/articles', async (req, res) => {
-  try {
-    const { featured, limit = 20, offset = 0, parent_article_id, debate_topic_id, topicId } = req.query;
-    
-    let query = `
-      SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
-             u.display_name, u.tier,
-             a.featured, ec.certified, a.is_debate_winner,
-             COALESCE(
-               ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
-               ARRAY[]::VARCHAR[]
-             ) as topics
-      FROM articles a
-      JOIN users u ON a.user_id = u.id
-      LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
-      LEFT JOIN article_topics at ON a.id = at.article_id
-      LEFT JOIN topics t ON at.topic_id = t.id
-      WHERE a.published = true
-    `;
-    
-    const params = [];
-    
-    // If debate_topic_id is specified, only include winning articles
-    if (debate_topic_id) {
-      query += ' AND a.debate_topic_id = $' + (params.length + 1) + ' AND a.is_debate_winner = true';
-      params.push(debate_topic_id);
-    } else {
-      // Otherwise, exclude all debate articles that are not winners
-      query += ' AND (a.debate_topic_id IS NULL OR a.is_debate_winner = true)';
-    }
-    
-    if (featured === 'true') {
-      query += ' AND a.featured = true';
-    }
-    
-    if (parent_article_id) {
-      query += ' AND a.parent_article_id = $' + (params.length + 1);
-      params.push(parent_article_id);
-    }
-    
-    if (topicId) {
-      query += ' AND EXISTS (SELECT 1 FROM article_topics WHERE article_id = a.id AND topic_id = $' + (params.length + 1) + ')';
-      params.push(topicId);
-    }
-    
-    query += ' GROUP BY a.id, u.display_name, u.tier, ec.certified ORDER BY a.created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
-    params.push(parseInt(limit), parseInt(offset));
-
-    const result = await pool.query(query, params);
-    
-    res.json({ articles: result.rows });
-  } catch (error) {
-    console.error('Get articles error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update the get single article route to include topics
-app.get('/api/articles/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    // First, get the article to check if it's published and who owns it
-    const articleResult = await pool.query(
-      `SELECT a.id, a.title, a.content, a.published, a.featured, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
-              u.display_name, u.tier, ec.certified,
-              COALESCE(
-                ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
-                ARRAY[]::VARCHAR[]
-              ) as topics
-       FROM articles a
-       JOIN users u ON a.user_id = u.id
-       LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
-       LEFT JOIN article_topics at ON a.id = at.article_id
-       LEFT JOIN topics t ON at.topic_id = t.id
-       WHERE a.id = $1
-       GROUP BY a.id, u.display_name, u.tier, ec.certified`,
-      [id]
-    );
-
-    if (articleResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Article not found' });
-    }
-
-    let article = articleResult.rows[0];
-    
-    // Only show published articles to non-owners
-    if (!article.published) {
-      // Check if user is the owner
-      const token = req.headers['authorization']?.split(' ')[1];
-      if (token) {
-        try {
-          const decoded = jwt.verify(token, process.env.JWT_SECRET);
-          const ownerCheck = await pool.query('SELECT user_id FROM articles WHERE id = $1', [id]);
-          if (ownerCheck.rows[0]?.user_id !== decoded.userId) {
-            return res.status(404).json({ error: 'Article not found' });
-          }
-        } catch {
-          return res.status(404).json({ error: 'Article not found' });
-        }
-      } else {
-        return res.status(404).json({ error: 'Article not found' });
-      }
-    }
-
-    // Check if we should increment the view count
-    // We'll use a session-based approach to prevent double counting
-    const sessionKey = `article_view_${id}`;
-    const hasViewed = req.session[sessionKey];
-    
-    // Only increment view count if article is published and not viewed in this session
-    if (article.published && !hasViewed) {
-      await pool.query(
-        'UPDATE articles SET views = views + 1 WHERE id = $1',
-        [id]
-      );
-      
-      // Mark as viewed in this session
-      req.session[sessionKey] = true;
-      
-      // Get updated view count
-      const updatedViewResult = await pool.query(
-        'SELECT views FROM articles WHERE id = $1',
-        [id]
-      );
-      
-      article.views = updatedViewResult.rows[0].views;
-    }
-
-    res.json({ article });
-
-  } catch (error) {
-    console.error('Get article error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update the get user's articles route to include topics
-app.get('/api/user/articles', authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT a.id, a.title, a.content, a.published, a.featured, a.views, a.created_at, a.updated_at, a.parent_article_id, a.debate_topic_id,
-              ec.certified,
-              COALESCE(
-                ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
-                ARRAY[]::VARCHAR[]
-              ) as topics
-       FROM articles a
-       LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
-       LEFT JOIN article_topics at ON a.id = at.article_id
-       LEFT JOIN topics t ON at.topic_id = t.id
-       WHERE a.user_id = $1 
-       GROUP BY a.id, ec.certified
-       ORDER BY a.updated_at DESC`,
-      [req.user.userId]
-    );
-
-    res.json({ articles: result.rows });
-  } catch (error) {
-    console.error('Get user articles error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
