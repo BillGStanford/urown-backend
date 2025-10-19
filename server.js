@@ -2499,6 +2499,7 @@ app.get('/api/admin/articles', authenticateEditorialBoard, async (req, res) => {
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
        LEFT JOIN article_topics at ON a.id = at.article_id
        LEFT JOIN topics t ON at.topic_id = t.id
+       GROUP BY a.id, u.id, u.display_name, u.tier, u.role, ec.certified
        ORDER BY a.created_at DESC`
     );
 
