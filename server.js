@@ -1,4 +1,3 @@
-// server.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -2934,6 +2933,70 @@ app.delete('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoa
     res.json({ message: 'Winner status removed successfully' });
   } catch (error) {
     console.error('Remove winner status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get public user profile by display name
+app.get('/api/users/:display_name', async (req, res) => {
+  try {
+    const { display_name } = req.params;
+    
+    // Replace spaces with actual spaces (URL encoding will handle this)
+    const decodedDisplayName = decodeURIComponent(display_name);
+    
+    // Get user info
+    const userResult = await pool.query(
+      `SELECT id, display_name, tier, role, created_at
+       FROM users 
+       WHERE display_name = $1 AND account_status = 'active'`,
+      [decodedDisplayName]
+    );
+    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = userResult.rows[0];
+    
+    // Get user's published articles
+    const articlesResult = await pool.query(
+      `SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views,
+              ec.certified, a.is_debate_winner,
+              COALESCE(
+                ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+                ARRAY[]::VARCHAR[]
+              ) as topics
+       FROM articles a
+       LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
+       LEFT JOIN article_topics at ON a.id = at.article_id
+       LEFT JOIN topics t ON at.topic_id = t.id
+       WHERE a.user_id = $1 AND a.published = true
+       GROUP BY a.id, ec.certified
+       ORDER BY a.created_at DESC`,
+      [user.id]
+    );
+    
+    // Calculate stats
+    const totalViews = articlesResult.rows.reduce((sum, article) => sum + (article.views || 0), 0);
+    const totalArticles = articlesResult.rows.length;
+    
+    res.json({
+      user: {
+        id: user.id,
+        display_name: user.display_name,
+        tier: user.tier,
+        role: user.role,
+        created_at: user.created_at
+      },
+      articles: articlesResult.rows,
+      stats: {
+        totalArticles,
+        totalViews
+      }
+    });
+  } catch (error) {
+    console.error('Get public user profile error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
