@@ -2734,11 +2734,11 @@ app.get('/api/debate-topics/:id/opinions', async (req, res) => {
 });
 
 // Create a new opinion for a debate topic (authenticated users)
-// Create a new opinion for a debate topic (both authenticated and unauthenticated users)
-app.post('/api/debate-topics/:id/opinions', async (req, res) => {
+app.post('/api/debate-topics/:id/opinions', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, content, author_name } = req.body;
+    const { title, content } = req.body;
+    const userId = req.user.userId;
     
     // Validate input
     if (!title?.trim() || !content?.trim()) {
@@ -2755,38 +2755,22 @@ app.post('/api/debate-topics/:id/opinions', async (req, res) => {
       return res.status(404).json({ error: 'Debate topic not found or expired' });
     }
     
-    // Check if user is authenticated
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    let userId = null;
+    // Check if user has already written an opinion for this topic
+    const existingOpinion = await pool.query(
+      'SELECT id FROM articles WHERE debate_topic_id = $1 AND user_id = $2',
+      [id, userId]
+    );
     
-    if (token) {
-      try {
-        // Verify token if provided
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        userId = decoded.userId;
-        
-        // Check if user has already written an opinion for this topic
-        const existingOpinion = await pool.query(
-          'SELECT id FROM articles WHERE debate_topic_id = $1 AND user_id = $2',
-          [id, userId]
-        );
-        
-        if (existingOpinion.rows.length > 0) {
-          return res.status(400).json({ error: 'You have already written an opinion for this debate topic' });
-        }
-      } catch (error) {
-        // Token is invalid, but we'll continue with unauthenticated user
-        console.log('Invalid token provided, continuing as unauthenticated user');
-      }
+    if (existingOpinion.rows.length > 0) {
+      return res.status(400).json({ error: 'You have already written an opinion for this debate topic' });
     }
     
     // Create the opinion as an article
     const result = await pool.query(
-      `INSERT INTO articles (user_id, title, content, published, debate_topic_id, author_name)
-       VALUES ($1, $2, $3, true, $4, $5)
+      `INSERT INTO articles (user_id, title, content, published, debate_topic_id)
+       VALUES ($1, $2, $3, true, $4)
        RETURNING *`,
-      [userId, title.trim(), content.trim(), id, userId ? null : (author_name || "Uncreated User")]
+      [userId, title.trim(), content.trim(), id]
     );
     
     res.status(201).json({
@@ -2795,39 +2779,6 @@ app.post('/api/debate-topics/:id/opinions', async (req, res) => {
     });
   } catch (error) {
     console.error('Create debate opinion error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update the opinions query to include author_name
-app.get('/api/debate-topics/:id/opinions', async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    // Check if debate topic exists and is active
-    const topicCheck = await pool.query(
-      'SELECT id FROM debate_topics WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP',
-      [id]
-    );
-    
-    if (topicCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Debate topic not found or expired' });
-    }
-    
-    // Get opinions for this topic
-    const opinionsResult = await pool.query(`
-      SELECT a.*, 
-             COALESCE(u.display_name, a.author_name) as display_name,
-             COALESCE(u.tier, 'Guest') as tier
-      FROM articles a
-      LEFT JOIN users u ON a.user_id = u.id
-      WHERE a.debate_topic_id = $1 AND a.published = true
-      ORDER BY a.created_at DESC
-    `, [id]);
-    
-    res.json({ opinions: opinionsResult.rows });
-  } catch (error) {
-    console.error('Get debate opinions error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
