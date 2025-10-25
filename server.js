@@ -184,7 +184,19 @@ const initDatabase = async () => {
         soft_deleted_at TIMESTAMP,
         hard_deleted_at TIMESTAMP,
         deletion_reason TEXT,
+        followers INTEGER DEFAULT 0,
         CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
+      )
+    `);
+
+    // Create followers table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS followers (
+        id SERIAL PRIMARY KEY,
+        follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(follower_id, following_id)
       )
     `);
 
@@ -1494,7 +1506,7 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, email, phone, full_name, display_name, tier, role, weekly_articles_count, weekly_reset_date, display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, created_at FROM users WHERE id = $1',
+      'SELECT id, email, phone, full_name, display_name, tier, role, weekly_articles_count, weekly_reset_date, display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, created_at, followers FROM users WHERE id = $1',
       [req.user.userId]
     );
 
@@ -1882,7 +1894,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
     // Check weekly limit only if publishing an original article (not a counter opinion or debate opinion)
     if (published && !parent_article_id && !debate_topic_id) {
       const userResult = await pool.query(
-        'SELECT weekly_articles_count, weekly_reset_date, tier FROM users WHERE id = $1',
+        'SELECT weekly_articles_count, tier FROM users WHERE id = $1',
         [userId]
       );
       
@@ -2947,7 +2959,7 @@ app.get('/api/users/:display_name', async (req, res) => {
     
     // Get user info
     const userResult = await pool.query(
-      `SELECT id, display_name, tier, role, created_at
+      `SELECT id, display_name, tier, role, created_at, followers
        FROM users 
        WHERE display_name = $1 AND account_status = 'active'`,
       [decodedDisplayName]
@@ -2981,13 +2993,32 @@ app.get('/api/users/:display_name', async (req, res) => {
     const totalViews = articlesResult.rows.reduce((sum, article) => sum + (article.views || 0), 0);
     const totalArticles = articlesResult.rows.length;
     
+    // Check if user is authenticated to determine if they're following this user
+    let isFollowing = false;
+    const authHeader = req.headers['authorization'];
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const followCheck = await pool.query(
+          'SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2',
+          [decoded.userId, user.id]
+        );
+        isFollowing = followCheck.rows.length > 0;
+      } catch (err) {
+        // Token is invalid, ignore
+      }
+    }
+    
     res.json({
       user: {
         id: user.id,
         display_name: user.display_name,
         tier: user.tier,
         role: user.role,
-        created_at: user.created_at
+        created_at: user.created_at,
+        followers: user.followers || 0,
+        isFollowing
       },
       articles: articlesResult.rows,
       stats: {
@@ -2997,6 +3028,101 @@ app.get('/api/users/:display_name', async (req, res) => {
     });
   } catch (error) {
     console.error('Get public user profile error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Follow a user
+app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const followerId = req.user.userId;
+    
+    // Check if user exists
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE id = $1 AND account_status = $2',
+      [id, 'active']
+    );
+    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Check if user is trying to follow themselves
+    if (parseInt(id) === followerId) {
+      return res.status(400).json({ error: 'You cannot follow yourself' });
+    }
+    
+    // Check if already following
+    const followCheck = await pool.query(
+      'SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2',
+      [followerId, id]
+    );
+    
+    if (followCheck.rows.length > 0) {
+      return res.status(400).json({ error: 'You are already following this user' });
+    }
+    
+    // Create follow relationship
+    await pool.query(
+      'INSERT INTO followers (follower_id, following_id) VALUES ($1, $2)',
+      [followerId, id]
+    );
+    
+    // Update follower count
+    await pool.query(
+      'UPDATE users SET followers = followers + 1 WHERE id = $1',
+      [id]
+    );
+    
+    res.json({ message: 'User followed successfully' });
+  } catch (error) {
+    console.error('Follow user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Unfollow a user
+app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const followerId = req.user.userId;
+    
+    // Check if user exists
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE id = $1 AND account_status = $2',
+      [id, 'active']
+    );
+    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Check if following
+    const followCheck = await pool.query(
+      'SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2',
+      [followerId, id]
+    );
+    
+    if (followCheck.rows.length === 0) {
+      return res.status(400).json({ error: 'You are not following this user' });
+    }
+    
+    // Remove follow relationship
+    await pool.query(
+      'DELETE FROM followers WHERE follower_id = $1 AND following_id = $2',
+      [followerId, id]
+    );
+    
+    // Update follower count
+    await pool.query(
+      'UPDATE users SET followers = followers - 1 WHERE id = $1',
+      [id]
+    );
+    
+    res.json({ message: 'User unfollowed successfully' });
+  } catch (error) {
+    console.error('Unfollow user error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
