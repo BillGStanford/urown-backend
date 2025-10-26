@@ -3069,11 +3069,11 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
       [followerId, id]
     );
     
-    // Update follower count
-    await pool.query(
-      'UPDATE users SET followers = followers + 1 WHERE id = $1',
-      [id]
-    );
+    // REMOVE THIS LINE - The trigger will handle this automatically
+    // await pool.query(
+    //   'UPDATE users SET followers = followers + 1 WHERE id = $1',
+    //   [id]
+    // );
     
     res.json({ message: 'User followed successfully' });
   } catch (error) {
@@ -3082,7 +3082,7 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
   }
 });
 
-// Unfollow a user
+// In the unfollow endpoint (around line 3320)
 app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -3114,11 +3114,11 @@ app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
       [followerId, id]
     );
     
-    // Update follower count
-    await pool.query(
-      'UPDATE users SET followers = followers - 1 WHERE id = $1',
-      [id]
-    );
+    // REMOVE THIS LINE - The trigger will handle this automatically
+    // await pool.query(
+    //   'UPDATE users SET followers = followers - 1 WHERE id = $1',
+    //   [id]
+    // );
     
     res.json({ message: 'User unfollowed successfully' });
   } catch (error) {
