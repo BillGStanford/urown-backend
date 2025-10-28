@@ -3127,6 +3127,113 @@ app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
   }
 });
 
+// Add this endpoint to your server.js file (around line 2700, after other admin routes)
+
+// Admin: Create article without account (admin only)
+app.post('/api/admin/articles/create', authenticateAdmin, async (req, res) => {
+  try {
+    const { username, title, content, topicIds = [] } = req.body;
+
+    // Validate input
+    if (!username?.trim()) {
+      return res.status(400).json({ error: 'Username is required' });
+    }
+
+    if (!title?.trim()) {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+
+    if (!content?.trim()) {
+      return res.status(400).json({ error: 'Content is required' });
+    }
+
+    if (title.length > 255) {
+      return res.status(400).json({ error: 'Title must be 255 characters or less' });
+    }
+
+    // Validate topic selection (max 3 topics)
+    if (topicIds.length > 3) {
+      return res.status(400).json({ error: 'You can select a maximum of 3 topics' });
+    }
+
+    // Validate that all topic IDs exist
+    if (topicIds.length > 0) {
+      const topicCheck = await pool.query(
+        'SELECT id FROM topics WHERE id = ANY($1)',
+        [topicIds]
+      );
+      
+      if (topicCheck.rows.length !== topicIds.length) {
+        return res.status(400).json({ error: 'One or more selected topics are invalid' });
+      }
+    }
+
+    // Create a temporary admin user entry or use a special admin user ID
+    // First, check if an "Admin" user exists, if not create one
+    let adminUserId;
+    const adminUserCheck = await pool.query(
+      'SELECT id FROM users WHERE display_name = $1',
+      [username.trim()]
+    );
+
+    if (adminUserCheck.rows.length > 0) {
+      // Use existing user with this display name
+      adminUserId = adminUserCheck.rows[0].id;
+    } else {
+      // Create a new pseudo-user for this admin post
+      // Generate a unique email based on username
+      const uniqueEmail = `admin_${username.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}@urown.internal`;
+      const randomPassword = Math.random().toString(36).substring(2, 15);
+      const passwordHash = await bcrypt.hash(randomPassword, 12);
+      
+      const newUserResult = await pool.query(
+        `INSERT INTO users (email, display_name, date_of_birth, password_hash, tier, role, terms_agreed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id`,
+        [uniqueEmail, username.trim(), '1990-01-01', passwordHash, 'Gold', 'user', true]
+      );
+      
+      adminUserId = newUserResult.rows[0].id;
+    }
+
+    // Create the article (always published, no restrictions)
+    const result = await pool.query(
+      `INSERT INTO articles (user_id, title, content, published, featured)
+       VALUES ($1, $2, $3, true, false)
+       RETURNING *`,
+      [adminUserId, title.trim(), content.trim()]
+    );
+
+    const article = result.rows[0];
+
+    // Link article with topics if provided
+    if (topicIds.length > 0) {
+      const topicValues = topicIds.map(topicId => `(${article.id}, ${topicId})`).join(', ');
+      await pool.query(
+        `INSERT INTO article_topics (article_id, topic_id) VALUES ${topicValues}`
+      );
+    }
+
+    // Log the admin action
+    await logAdminAction(
+      req.user.userId,
+      'create_admin_article',
+      'article',
+      article.id,
+      `Created admin article: "${title.trim()}" by ${username.trim()}`
+    );
+
+    res.status(201).json({
+      message: 'Article posted successfully',
+      article
+    });
+
+  } catch (error) {
+    console.error('Admin create article error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Logout (client-side token removal, server-side acknowledgment)
 app.post('/api/auth/logout', authenticateToken, (req, res) => {
   res.json({ message: 'Logged out successfully' });
