@@ -3168,8 +3168,8 @@ app.post('/api/admin/articles/create', authenticateAdmin, async (req, res) => {
       }
     }
 
-    // Create a temporary admin user entry or use a special admin user ID
-    // First, check if an "Admin" user exists, if not create one
+    // Check if a user with this display name already exists
+    // If so, reuse that user account; otherwise, create a new one
     let adminUserId;
     const adminUserCheck = await pool.query(
       'SELECT id FROM users WHERE display_name = $1',
@@ -3190,7 +3190,7 @@ app.post('/api/admin/articles/create', authenticateAdmin, async (req, res) => {
         `INSERT INTO users (email, display_name, date_of_birth, password_hash, tier, role, terms_agreed)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING id`,
-        [uniqueEmail, username.trim(), '1990-01-01', passwordHash, 'Gold', 'user', true]
+        [uniqueEmail, username.trim(), '1990-01-01', passwordHash, 'Silver', 'user', true]
       );
       
       adminUserId = newUserResult.rows[0].id;
