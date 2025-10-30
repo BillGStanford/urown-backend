@@ -15,50 +15,6 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Simple in-memory cache implementation
-const cache = new Map();
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes default TTL
-
-const getCachedData = (key) => {
-  const item = cache.get(key);
-  if (item && Date.now() < item.expiry) {
-    return item.data;
-  }
-  cache.delete(key);
-  return null;
-};
-
-const setCachedData = (key, data, ttl = CACHE_TTL) => {
-  cache.set(key, {
-    data,
-    expiry: Date.now() + ttl
-  });
-};
-
-const clearCache = (pattern) => {
-  if (typeof pattern === 'string') {
-    cache.delete(pattern);
-  } else if (pattern instanceof RegExp) {
-    for (const key of cache.keys()) {
-      if (pattern.test(key)) {
-        cache.delete(key);
-      }
-    }
-  }
-};
-
-const clearAllArticleCache = () => {
-  // Clear all article-related cache keys
-  for (const key of cache.keys()) {
-    if (key.startsWith('articles-') || key.startsWith('debate-topics') || key.startsWith('topics')) {
-      cache.delete(key);
-    }
-  }
-};
-
-// SSE clients for real-time updates
-const updateClients = new Set();
-
 // Database connection
 let pool;
 if (process.env.DATABASE_URL) {
@@ -185,6 +141,7 @@ const initDatabase = async () => {
   try {
     // Check if the full_name column needs to be modified
     try {
+      // First check if the column exists and its constraints
       const columnCheck = await pool.query(`
         SELECT column_name, is_nullable 
         FROM information_schema.columns 
@@ -192,6 +149,7 @@ const initDatabase = async () => {
       `);
       
       if (columnCheck.rows.length > 0 && columnCheck.rows[0].is_nullable === 'NO') {
+        // If the column exists but doesn't allow NULL, alter it
         await pool.query(`
           ALTER TABLE users ALTER COLUMN full_name DROP NOT NULL
         `);
@@ -240,30 +198,6 @@ const initDatabase = async () => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(follower_id, following_id)
       )
-    `);
-
-    // Create trigger to update followers count
-    await pool.query(`
-      CREATE OR REPLACE FUNCTION update_followers_count()
-      RETURNS TRIGGER AS $$       BEGIN
-        IF TG_OP = 'INSERT' THEN
-          UPDATE users SET followers = followers + 1 WHERE id = NEW.following_id;
-          RETURN NEW;
-        ELSIF TG_OP = 'DELETE' THEN
-          UPDATE users SET followers = followers - 1 WHERE id = OLD.following_id;
-          RETURN OLD;
-        END IF;
-        RETURN NULL;
-      END;
-      $$ LANGUAGE plpgsql;
-    `);
-
-    await pool.query(`
-      DROP TRIGGER IF EXISTS followers_trigger ON followers;
-      CREATE TRIGGER followers_trigger
-        AFTER INSERT OR DELETE ON followers
-        FOR EACH ROW
-        EXECUTE FUNCTION update_followers_count();
     `);
 
     // Create topics table
@@ -324,14 +258,13 @@ const initDatabase = async () => {
       )
     `);
 
-    // Create editorial board certifications table with expiration support
+    // Create editorial board certifications table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS editorial_certifications (
         id SERIAL PRIMARY KEY,
         article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
         admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
         certified BOOLEAN DEFAULT FALSE,
-        expires_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(article_id)
@@ -449,35 +382,6 @@ const initDatabase = async () => {
   }
 };
 
-// Function to check and expire certifications
-const checkExpiredCertifications = async () => {
-  try {
-    const result = await pool.query(`
-      UPDATE editorial_certifications 
-      SET certified = FALSE 
-      WHERE certified = TRUE AND expires_at <= CURRENT_TIMESTAMP
-      RETURNING article_id
-    `);
-    
-    if (result.rows.length > 0) {
-      console.log(`Expired ${result.rows.length} certifications`);
-      clearAllArticleCache();
-      
-      // Notify clients about certification changes
-      result.rows.forEach(row => {
-        updateClients.forEach(client => {
-          client.write(`data: ${JSON.stringify({ type: 'certification_expired', articleId: row.article_id })}\n\n`);
-        });
-      });
-    }
-  } catch (error) {
-    console.error('Error checking expired certifications:', error);
-  }
-};
-
-// Check expired certifications every hour
-setInterval(checkExpiredCertifications, 60 * 60 * 1000);
-
 // JWT middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -501,6 +405,7 @@ const authenticateToken = (req, res, next) => {
 
       if (banResult.rows.length > 0) {
         const ban = banResult.rows[0];
+        // Calculate remaining time in a human-readable format
         const banEnd = new Date(ban.ban_end);
         const now = new Date();
         const diffMs = banEnd - now;
@@ -523,6 +428,7 @@ const authenticateToken = (req, res, next) => {
       }
     } catch (error) {
       console.error('Error checking ban status:', error);
+      // Continue to next if there's an error checking ban
     }
 
     req.user = user;
@@ -627,14 +533,7 @@ const logAdminAction = async (adminId, action, targetType, targetId, details = n
   }
 };
 
-// Function to notify clients of updates
-const notifyClients = (data) => {
-  updateClients.forEach(client => {
-    client.write(`data: ${JSON.stringify(data)}\n\n`);
-  });
-};
-
-// Validation middleware
+// server.js - Update the validateSignup middleware
 const validateSignup = [
   body('email').notEmpty().withMessage('Email is required')
     .isEmail().normalizeEmail().withMessage('Please enter a valid email address'),
@@ -648,6 +547,7 @@ const validateSignup = [
   (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
+      // Return more detailed error information
       const errorMessages = errors.array().map(error => error.msg);
       return res.status(400).json({ 
         error: 'Validation failed', 
@@ -670,29 +570,6 @@ const validateLogin = [
   }
 ];
 
-// SSE endpoint for real-time updates
-app.get('/api/updates', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  
-  // Send initial connection message
-  res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
-  
-  // Add client to updateClients set
-  updateClients.add(res);
-  
-  // Clean up on disconnect
-  req.on('close', () => {
-    updateClients.delete(res);
-  });
-  
-  req.on('error', () => {
-    updateClients.delete(res);
-  });
-});
-
 // Routes
 app.get('/api/health', async (req, res) => {
   try {
@@ -707,16 +584,8 @@ app.get('/api/health', async (req, res) => {
 // Get all available topics
 app.get('/api/topics', async (req, res) => {
   try {
-    const cacheKey = 'topics-all';
-    let cachedData = getCachedData(cacheKey);
-    
-    if (!cachedData) {
-      const result = await pool.query('SELECT * FROM topics ORDER BY name');
-      cachedData = result.rows;
-      setCachedData(cacheKey, cachedData, 10 * 60 * 1000); // Cache for 10 minutes
-    }
-    
-    res.json({ topics: cachedData });
+    const result = await pool.query('SELECT * FROM topics ORDER BY name');
+    res.json({ topics: result.rows });
   } catch (error) {
     console.error('Get topics error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -728,6 +597,7 @@ app.post('/api/contact', async (req, res) => {
   try {
     const { name, email, phone, category, content } = req.body;
 
+    // Validate input
     if (!name || !name.trim()) {
       return res.status(400).json({ error: 'Name is required' });
     }
@@ -748,6 +618,7 @@ app.post('/api/contact', async (req, res) => {
       return res.status(400).json({ error: 'Content is required' });
     }
 
+    // Insert into database
     const result = await pool.query(
       `INSERT INTO contact_messages (name, email, phone, category, content)
        VALUES ($1, $2, $3, $4, $5)
@@ -810,11 +681,13 @@ app.put('/api/admin/contacts/:id/status', authenticateSuperAdmin, async (req, re
     const { id } = req.params;
     const { status } = req.body;
 
+    // Validate status
     const validStatuses = ['waiting', 'in_progress', 'resolved'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
+    // Check if contact message exists
     const contactResult = await pool.query(
       'SELECT * FROM contact_messages WHERE id = $1',
       [id]
@@ -824,6 +697,7 @@ app.put('/api/admin/contacts/:id/status', authenticateSuperAdmin, async (req, re
       return res.status(404).json({ error: 'Contact message not found' });
     }
 
+    // Update status
     await pool.query(
       'UPDATE contact_messages SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
       [status, id]
@@ -841,6 +715,7 @@ app.delete('/api/admin/contacts/:id', authenticateSuperAdmin, async (req, res) =
   try {
     const { id } = req.params;
 
+    // Check if contact message exists
     const contactResult = await pool.query(
       'SELECT * FROM contact_messages WHERE id = $1',
       [id]
@@ -850,6 +725,7 @@ app.delete('/api/admin/contacts/:id', authenticateSuperAdmin, async (req, res) =
       return res.status(404).json({ error: 'Contact message not found' });
     }
 
+    // Delete contact message
     await pool.query('DELETE FROM contact_messages WHERE id = $1', [id]);
 
     res.json({ message: 'Contact message deleted successfully' });
@@ -866,6 +742,7 @@ app.post('/api/articles/:id/report', authenticateToken, async (req, res) => {
     const { reason } = req.body;
     const userId = req.user.userId;
 
+    // Check if article exists
     const articleResult = await pool.query(
       'SELECT * FROM articles WHERE id = $1',
       [id]
@@ -875,6 +752,7 @@ app.post('/api/articles/:id/report', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Article not found' });
     }
 
+    // Check if user has already reported this article
     const existingReport = await pool.query(
       'SELECT id FROM reported_articles WHERE article_id = $1 AND user_id = $2',
       [id, userId]
@@ -884,16 +762,13 @@ app.post('/api/articles/:id/report', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'You have already reported this article' });
     }
 
+    // Create report
     const result = await pool.query(
       `INSERT INTO reported_articles (article_id, user_id, reason)
        VALUES ($1, $2, $3)
        RETURNING *`,
       [id, userId, reason]
     );
-
-    // Clear cache and notify clients
-    clearAllArticleCache();
-    notifyClients({ type: 'article_reported', articleId: id });
 
     res.status(201).json({
       message: 'Article reported successfully',
@@ -945,11 +820,13 @@ app.put('/api/admin/reported-articles/:id/status', authenticateAdmin, async (req
     const { id } = req.params;
     const { status } = req.body;
 
+    // Validate status
     const validStatuses = ['pending', 'reviewed', 'resolved', 'dismissed'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
+    // Check if report exists
     const reportResult = await pool.query(
       'SELECT * FROM reported_articles WHERE id = $1',
       [id]
@@ -959,6 +836,7 @@ app.put('/api/admin/reported-articles/:id/status', authenticateAdmin, async (req
       return res.status(404).json({ error: 'Report not found' });
     }
 
+    // Update status
     await pool.query(
       'UPDATE reported_articles SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
       [status, id]
@@ -976,6 +854,7 @@ app.delete('/api/admin/articles/:id/delete', authenticateAdmin, async (req, res)
   try {
     const { id } = req.params;
 
+    // Get article data before deletion for logging
     const articleResult = await pool.query(
       `SELECT a.*, u.display_name as author_name 
        FROM articles a
@@ -990,8 +869,10 @@ app.delete('/api/admin/articles/:id/delete', authenticateAdmin, async (req, res)
     
     const article = articleResult.rows[0];
     
+    // Delete article
     await pool.query('DELETE FROM articles WHERE id = $1', [id]);
     
+    // Log the action
     await logAdminAction(
       req.user.userId,
       'delete_reported',
@@ -999,10 +880,6 @@ app.delete('/api/admin/articles/:id/delete', authenticateAdmin, async (req, res)
       parseInt(id),
       `Deleted reported article: ${article.title} by ${article.author_name}`
     );
-    
-    // Clear cache and notify clients
-    clearAllArticleCache();
-    notifyClients({ type: 'article_deleted', articleId: id });
     
     res.json({ message: 'Article deleted successfully' });
   } catch (error) {
@@ -1021,6 +898,7 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
       return res.status(400).json({ error: 'Reason is required' });
     }
 
+    // Check if user exists
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1',
       [userId]
@@ -1032,16 +910,19 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
 
     const user = userResult.rows[0];
 
+    // Don't allow warnings for deleted accounts
     if (user.account_status === 'soft_deleted' || user.account_status === 'hard_deleted') {
       return res.status(400).json({ error: 'Cannot warn a deleted account' });
     }
 
+    // Add the warning
     await pool.query(
       `INSERT INTO user_warnings (user_id, reason, admin_id)
        VALUES ($1, $2, $3)`,
       [userId, reason, req.user.userId]
     );
 
+    // Count warnings for this user
     const warningCountResult = await pool.query(
       'SELECT COUNT(*) as count FROM user_warnings WHERE user_id = $1',
       [userId]
@@ -1049,6 +930,7 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
 
     const warningCount = parseInt(warningCountResult.rows[0].count);
 
+    // If user has 3 warnings, mark for deletion
     if (warningCount >= 3) {
       await pool.query(
         `UPDATE users 
@@ -1059,6 +941,7 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
         [userId]
       );
 
+      // Log the action
       await logAdminAction(
         req.user.userId,
         'soft_delete',
@@ -1085,6 +968,7 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
   try {
     const { userId, warningId } = req.params;
 
+    // Check if warning exists and belongs to user
     const warningResult = await pool.query(
       'SELECT * FROM user_warnings WHERE id = $1 AND user_id = $2',
       [warningId, userId]
@@ -1094,11 +978,13 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
       return res.status(404).json({ error: 'Warning not found' });
     }
 
+    // Delete the warning
     await pool.query(
       'DELETE FROM user_warnings WHERE id = $1',
       [warningId]
     );
 
+    // Count remaining warnings
     const warningCountResult = await pool.query(
       'SELECT COUNT(*) as count FROM user_warnings WHERE user_id = $1',
       [userId]
@@ -1106,6 +992,7 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
 
     const warningCount = parseInt(warningCountResult.rows[0].count);
 
+    // If user was soft deleted due to warnings and now has less than 3, reactivate
     if (warningCount < 3) {
       const userResult = await pool.query(
         'SELECT * FROM users WHERE id = $1',
@@ -1124,6 +1011,7 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
           [userId]
         );
 
+        // Log the action
         await logAdminAction(
           req.user.userId,
           'reactivate',
@@ -1177,6 +1065,7 @@ app.post('/api/admin/users/:userId/undo-delete', authenticateAdmin, async (req, 
   try {
     const { userId } = req.params;
 
+    // Check if user exists and is soft deleted
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1 AND account_status = $2',
       [userId, 'soft_deleted']
@@ -1188,6 +1077,7 @@ app.post('/api/admin/users/:userId/undo-delete', authenticateAdmin, async (req, 
 
     const user = userResult.rows[0];
 
+    // Reactivate the account
     await pool.query(
       `UPDATE users 
        SET account_status = 'active', 
@@ -1197,6 +1087,7 @@ app.post('/api/admin/users/:userId/undo-delete', authenticateAdmin, async (req, 
       [userId]
     );
 
+    // Log the action
     await logAdminAction(
       req.user.userId,
       'undo_delete',
@@ -1213,9 +1104,10 @@ app.post('/api/admin/users/:userId/undo-delete', authenticateAdmin, async (req, 
   }
 });
 
-// Cleanup old warnings
+// Cleanup old warnings (remove warnings older than 2 weeks with no new warnings)
 app.post('/api/admin/cleanup-warnings', authenticateAdmin, async (req, res) => {
   try {
+    // Find users whose latest warning is older than 2 weeks
     const usersToClean = await pool.query(`
       SELECT user_id, MAX(created_at) as last_warning
       FROM user_warnings
@@ -1226,6 +1118,7 @@ app.post('/api/admin/cleanup-warnings', authenticateAdmin, async (req, res) => {
     let cleanedCount = 0;
     
     for (const user of usersToClean.rows) {
+      // Delete all warnings for this user
       await pool.query(
         'DELETE FROM user_warnings WHERE user_id = $1',
         [user.user_id]
@@ -1248,6 +1141,7 @@ app.post('/api/admin/cleanup-warnings', authenticateAdmin, async (req, res) => {
 // Hard delete accounts that have been soft deleted for 5+ days
 app.post('/api/admin/hard-delete-accounts', authenticateAdmin, async (req, res) => {
   try {
+    // Find users soft deleted 5+ days ago
     const usersToDelete = await pool.query(`
       SELECT id, display_name, email
       FROM users
@@ -1258,11 +1152,13 @@ app.post('/api/admin/hard-delete-accounts', authenticateAdmin, async (req, res) 
     let deletedCount = 0;
     
     for (const user of usersToDelete.rows) {
+      // Hard delete the user (articles will remain with user_id set to NULL)
       await pool.query(
         'DELETE FROM users WHERE id = $1',
         [user.id]
       );
       
+      // Log the action
       await logAdminAction(
         req.user.userId,
         'hard_delete',
@@ -1291,6 +1187,7 @@ app.post('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
     const { id } = req.params;
     const { banEnd, reason } = req.body;
 
+    // Validate banEnd (should be a future date)
     if (!banEnd || new Date(banEnd) <= new Date()) {
       return res.status(400).json({ error: 'Ban end time must be in the future' });
     }
@@ -1299,6 +1196,7 @@ app.post('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Reason is required' });
     }
 
+    // Check if user exists
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1',
       [id]
@@ -1308,6 +1206,7 @@ app.post('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    // Check if user is already banned
     const existingBan = await pool.query(
       'SELECT * FROM user_bans WHERE user_id = $1 AND ban_end > CURRENT_TIMESTAMP',
       [id]
@@ -1317,12 +1216,14 @@ app.post('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
       return res.status(400).json({ error: 'User is already banned' });
     }
 
+    // Create the ban
     await pool.query(
       `INSERT INTO user_bans (user_id, ban_end, reason, admin_id)
        VALUES ($1, $2, $3, $4)`,
       [id, banEnd, reason, req.user.userId]
     );
 
+    // Log the action
     await logAdminAction(
       req.user.userId,
       'ban',
@@ -1343,6 +1244,7 @@ app.delete('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
+    // Check if user exists and is banned
     const banResult = await pool.query(
       'SELECT * FROM user_bans WHERE user_id = $1 AND ban_end > CURRENT_TIMESTAMP',
       [id]
@@ -1352,11 +1254,13 @@ app.delete('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
       return res.status(404).json({ error: 'User is not currently banned' });
     }
 
+    // Remove the ban by setting ban_end to now
     await pool.query(
       'UPDATE user_bans SET ban_end = CURRENT_TIMESTAMP WHERE user_id = $1',
       [id]
     );
 
+    // Log the action
     await logAdminAction(
       req.user.userId,
       'unban',
@@ -1373,30 +1277,37 @@ app.delete('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
 });
 
 // Signup
+// In server.js, update the signup route
 app.post('/api/auth/signup', async (req, res) => {
   try {
     const { email, phone, full_name, display_name, date_of_birth, password, terms_agreed } = req.body;
     
+    // Manual validation for better error messages
     const errors = {};
     
+    // Email validation
     if (!email) {
       errors.email = 'Email is required';
     } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       errors.email = 'Please enter a valid email address';
     }
     
+    // Phone validation (optional)
     if (phone && !/^\+?[1-9]\d{1,14}$/.test(phone.replace(/\s/g, ''))) {
       errors.phone = 'Please enter a valid phone number';
     }
     
+    // Full name validation (now optional)
     if (full_name && full_name.trim().length > 0 && full_name.trim().length < 2) {
       errors.full_name = 'Full name must be at least 2 characters';
     }
     
+    // Display name validation
     if (!display_name || display_name.trim().length < 2) {
       errors.display_name = 'Display name must be at least 2 characters';
     }
     
+    // Date of birth validation
     if (!date_of_birth) {
       errors.date_of_birth = 'Date of birth is required';
     } else {
@@ -1408,16 +1319,19 @@ app.post('/api/auth/signup', async (req, res) => {
       }
     }
     
+    // Password validation
     if (!password || password.length < 8) {
       errors.password = 'Password must be at least 8 characters';
     } else if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(password)) {
       errors.password = 'Password must contain uppercase, lowercase, and number';
     }
     
+    // Terms validation
     if (terms_agreed !== true) {
       errors.terms_agreed = 'You must agree to the terms of service';
     }
     
+    // If there are validation errors, return them
     if (Object.keys(errors).length > 0) {
       return res.status(400).json({ 
         error: 'Validation failed', 
@@ -1425,6 +1339,7 @@ app.post('/api/auth/signup', async (req, res) => {
       });
     }
     
+    // Check if email already exists
     const existingUser = await pool.query(
       'SELECT id FROM users WHERE email = $1 OR display_name = $2',
       [email, display_name]
@@ -1434,9 +1349,11 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ error: 'Email or display name already exists' });
     }
 
+    // Hash password
     const saltRounds = 12;
     const password_hash = await bcrypt.hash(password, saltRounds);
 
+    // Create user (phone and full_name are now optional)
     const result = await pool.query(
       `INSERT INTO users (email, phone, full_name, display_name, date_of_birth, password_hash, terms_agreed)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -1446,6 +1363,7 @@ app.post('/api/auth/signup', async (req, res) => {
 
     const user = result.rows[0];
 
+    // Generate JWT token
     const token = jwt.sign(
       { userId: user.id, email: user.email, displayName: user.display_name },
       process.env.JWT_SECRET,
@@ -1469,6 +1387,7 @@ app.post('/api/auth/signup', async (req, res) => {
 
   } catch (error) {
     console.error('Signup error:', error);
+    // Return more detailed error information
     res.status(500).json({ 
       error: 'Internal server error', 
       details: error.message || 'An unknown error occurred during registration' 
@@ -1477,16 +1396,19 @@ app.post('/api/auth/signup', async (req, res) => {
 });
 
 // Login
+// server.js - Update the login route
 app.post('/api/auth/login', validateLogin, async (req, res) => {
   try {
     const { identifier, password } = req.body;
 
+    // Find user by email or display_name
     const result = await pool.query(
       'SELECT * FROM users WHERE (email = $1 OR display_name = $1) AND account_status = $2',
       [identifier, 'active']
     );
 
     if (result.rows.length === 0) {
+      // Check if account exists but is deleted
       const deletedUserResult = await pool.query(
         'SELECT * FROM users WHERE (email = $1 OR display_name = $1) AND account_status IN ($2, $3)',
         [identifier, 'soft_deleted', 'hard_deleted']
@@ -1512,11 +1434,13 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
 
     const user = result.rows[0];
 
+    // Verify password
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
     if (!isValidPassword) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
+    // Check if user is banned
     const banResult = await pool.query(
       'SELECT ban_end, reason FROM user_bans WHERE user_id = $1 AND ban_end > CURRENT_TIMESTAMP',
       [user.id]
@@ -1524,6 +1448,7 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
 
     if (banResult.rows.length > 0) {
       const ban = banResult.rows[0];
+      // Calculate remaining time in a human-readable format
       const banEnd = new Date(ban.ban_end);
       const now = new Date();
       const diffMs = banEnd - now;
@@ -1545,6 +1470,7 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
       });
     }
 
+    // Generate JWT token
     const token = jwt.sign(
       { userId: user.id, email: user.email, displayName: user.display_name },
       process.env.JWT_SECRET,
@@ -1590,6 +1516,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
 
     const user = result.rows[0];
 
+    // Check if we need to reset weekly article count
     const now = new Date();
     const resetDate = new Date(user.weekly_reset_date);
     const daysSinceReset = Math.floor((now - resetDate) / (24 * 60 * 60 * 1000));
@@ -1610,12 +1537,13 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// Update user profile
+// Update user profile (display name, email, phone)
 app.put('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { display_name, email, phone } = req.body;
 
+    // Get current user data
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1',
       [userId]
@@ -1631,6 +1559,7 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
     const values = [];
     let queryIndex = 1;
 
+    // Check display name update
     if (display_name && display_name !== user.display_name) {
       const lastUpdate = user.display_name_updated_at ? new Date(user.display_name_updated_at) : null;
       const daysSinceLastUpdate = lastUpdate ? Math.floor((now - lastUpdate) / (24 * 60 * 60 * 1000)) : 14;
@@ -1642,6 +1571,7 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
         });
       }
 
+      // Check if display name is already in use by another user
       const displayNameCheck = await pool.query(
         'SELECT id FROM users WHERE display_name = $1 AND id != $2',
         [display_name, userId]
@@ -1657,6 +1587,7 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
       values.push(now);
     }
 
+    // Check email update
     if (email && email !== user.email) {
       const lastUpdate = user.email_updated_at ? new Date(user.email_updated_at) : null;
       const daysSinceLastUpdate = lastUpdate ? Math.floor((now - lastUpdate) / (24 * 60 * 60 * 1000)) : 14;
@@ -1668,6 +1599,7 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
         });
       }
 
+      // Check if email is already in use by another user
       const emailCheck = await pool.query(
         'SELECT id FROM users WHERE email = $1 AND id != $2',
         [email, userId]
@@ -1683,6 +1615,7 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
       values.push(now);
     }
 
+    // Check phone update
     if (phone !== undefined && phone !== user.phone) {
       const lastUpdate = user.phone_updated_at ? new Date(user.phone_updated_at) : null;
       const daysSinceLastUpdate = lastUpdate ? Math.floor((now - lastUpdate) / (24 * 60 * 60 * 1000)) : 14;
@@ -1694,6 +1627,7 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
         });
       }
 
+      // Check if phone is already in use by another user
       if (phone) {
         const phoneCheck = await pool.query(
           'SELECT id FROM users WHERE phone = $1 AND id != $2',
@@ -1715,8 +1649,10 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'No changes provided' });
     }
 
+    // Add user ID to values
     values.push(userId);
 
+    // Update the user
     const updateQuery = `
       UPDATE users 
       SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP 
@@ -1748,6 +1684,7 @@ app.put('/api/user/password', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Current password and new password are required' });
     }
 
+    // Get current user data
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1',
       [userId]
@@ -1760,6 +1697,7 @@ app.put('/api/user/password', authenticateToken, async (req, res) => {
     const user = userResult.rows[0];
     const now = new Date();
 
+    // Check if password can be changed (14-day cooldown)
     const lastUpdate = user.password_updated_at ? new Date(user.password_updated_at) : null;
     const daysSinceLastUpdate = lastUpdate ? Math.floor((now - lastUpdate) / (24 * 60 * 60 * 1000)) : 14;
 
@@ -1770,14 +1708,17 @@ app.put('/api/user/password', authenticateToken, async (req, res) => {
       });
     }
 
+    // Verify current password
     const isValidPassword = await bcrypt.compare(current_password, user.password_hash);
     if (!isValidPassword) {
       return res.status(401).json({ error: 'Current password is incorrect' });
     }
 
+    // Hash new password
     const saltRounds = 12;
     const newPasswordHash = await bcrypt.hash(new_password, saltRounds);
 
+    // Update password
     await pool.query(
       'UPDATE users SET password_hash = $1, password_updated_at = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3',
       [newPasswordHash, now, userId]
@@ -1801,6 +1742,7 @@ app.delete('/api/user', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Incorrect confirmation text' });
     }
 
+    // Get user data for logging
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1',
       [userId]
@@ -1812,6 +1754,7 @@ app.delete('/api/user', authenticateToken, async (req, res) => {
 
     const user = userResult.rows[0];
 
+    // Soft delete the user
     await pool.query(
       `UPDATE users 
        SET account_status = 'soft_deleted', 
@@ -1821,6 +1764,7 @@ app.delete('/api/user', authenticateToken, async (req, res) => {
       [userId]
     );
 
+    // Log the action
     await logAdminAction(
       userId,
       'delete_account',
@@ -1840,6 +1784,7 @@ app.delete('/api/user', authenticateToken, async (req, res) => {
 // Get user statistics
 app.get('/api/user/stats', authenticateToken, async (req, res) => {
   try {
+    // Get user's articles
     const articlesResult = await pool.query(
       `SELECT id, published, views, created_at, updated_at
        FROM articles 
@@ -1851,6 +1796,7 @@ app.get('/api/user/stats', authenticateToken, async (req, res) => {
     const publishedArticles = articles.filter(article => article.published).length;
     const draftArticles = articles.filter(article => !article.published).length;
     
+    // Calculate total views
     const totalViews = articles.reduce((sum, article) => sum + (article.views || 0), 0);
     
     res.json({
@@ -1873,6 +1819,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
     const { title, content, published = false, featured = false, parent_article_id, debate_topic_id, topicIds = [] } = req.body;
     const userId = req.user.userId;
 
+    // Validate input
     if (!title?.trim() || !content?.trim()) {
       return res.status(400).json({ error: 'Title and content are required' });
     }
@@ -1881,10 +1828,12 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Title must be 255 characters or less' });
     }
 
+    // Validate topic selection (max 3 topics)
     if (topicIds.length > 3) {
       return res.status(400).json({ error: 'You can select a maximum of 3 topics' });
     }
 
+    // Validate that all topic IDs exist
     if (topicIds.length > 0) {
       const topicCheck = await pool.query(
         'SELECT id FROM topics WHERE id = ANY($1)',
@@ -1896,7 +1845,9 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
       }
     }
 
+    // If this is a counter opinion, validate the parent article
     if (parent_article_id) {
+      // Check if parent article exists and is published
       const parentResult = await pool.query(
         'SELECT id FROM articles WHERE id = $1 AND published = true',
         [parent_article_id]
@@ -1906,6 +1857,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
         return res.status(400).json({ error: 'Parent article not found or not published' });
       }
 
+      // Check if parent article already has 5 counter opinions
       const counterCountResult = await pool.query(
         'SELECT COUNT(*) as count FROM articles WHERE parent_article_id = $1',
         [parent_article_id]
@@ -1916,7 +1868,9 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
       }
     }
 
+    // If this is a debate opinion, validate the debate topic
     if (debate_topic_id) {
+      // Check if debate topic exists and is active
       const topicResult = await pool.query(
         'SELECT id FROM debate_topics WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP',
         [debate_topic_id]
@@ -1926,6 +1880,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
         return res.status(400).json({ error: 'Debate topic not found or expired' });
       }
 
+      // Check if user has already written an opinion for this topic
       const existingOpinion = await pool.query(
         'SELECT id FROM articles WHERE debate_topic_id = $1 AND user_id = $2',
         [debate_topic_id, userId]
@@ -1936,6 +1891,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
       }
     }
 
+    // Check weekly limit only if publishing an original article (not a counter opinion or debate opinion)
     if (published && !parent_article_id && !debate_topic_id) {
       const userResult = await pool.query(
         'SELECT weekly_articles_count, tier FROM users WHERE id = $1',
@@ -1950,6 +1906,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
       }
     }
 
+    // Create article
     const result = await pool.query(
       'INSERT INTO articles (user_id, title, content, published, featured, parent_article_id, debate_topic_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
       [userId, title.trim(), content.trim(), published, featured, parent_article_id || null, debate_topic_id || null]
@@ -1957,6 +1914,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
 
     const article = result.rows[0];
 
+    // Link article with topics if provided
     if (topicIds.length > 0) {
       const topicValues = topicIds.map(topicId => `(${article.id}, ${topicId})`).join(', ');
       await pool.query(
@@ -1964,6 +1922,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
       );
     }
 
+    // Update weekly count only if publishing an original article (not a counter opinion or debate opinion)
     if (published && !parent_article_id && !debate_topic_id) {
       await pool.query(
         'UPDATE users SET weekly_articles_count = weekly_articles_count + 1 WHERE id = $1',
@@ -1971,6 +1930,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
       );
     }
 
+    // Get updated user data to return to client
     const updatedUserResult = await pool.query(
       'SELECT id, email, phone, full_name, display_name, tier, role, weekly_articles_count, weekly_reset_date, display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, created_at FROM users WHERE id = $1',
       [userId]
@@ -1978,6 +1938,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
 
     const updatedUser = updatedUserResult.rows[0];
 
+    // Get updated user statistics
     const statsResult = await pool.query(
       `SELECT 
         COUNT(*) as total_articles,
@@ -1996,10 +1957,6 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
       views: parseInt(statsResult.rows[0].total_views) || 0
     };
 
-    // Clear cache and notify clients
-    clearAllArticleCache();
-    notifyClients({ type: 'article_created', article });
-
     res.status(201).json({
       message: published ? 'Article published successfully' : 'Article saved as draft',
       article,
@@ -2016,68 +1973,55 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
 // Get all published articles (for browse and homepage)
 app.get('/api/articles', async (req, res) => {
   try {
-    const { featured, limit = 20, offset = 0, parent_article_id, debate_topic_id, topicId, certified } = req.query;
+    const { featured, limit = 20, offset = 0, parent_article_id, debate_topic_id, topicId } = req.query;
     
-    // Create cache key based on query parameters
-    const cacheKey = `articles-${limit}-${offset}-${featured || 'false'}-${parent_article_id || 'null'}-${debate_topic_id || 'null'}-${topicId || 'null'}-${certified || 'false'}`;
+    let query = `
+      SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
+             u.display_name, u.tier,
+             a.featured, ec.certified, a.is_debate_winner,
+             COALESCE(
+               ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+               ARRAY[]::VARCHAR[]
+             ) as topics
+      FROM articles a
+      JOIN users u ON a.user_id = u.id
+      LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
+      LEFT JOIN article_topics at ON a.id = at.article_id
+      LEFT JOIN topics t ON at.topic_id = t.id
+      WHERE a.published = true
+    `;
     
-    let cachedData = getCachedData(cacheKey);
+    const params = [];
     
-    if (!cachedData) {
-      let query = `
-        SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
-               u.display_name, u.tier,
-               a.featured, ec.certified, a.is_debate_winner,
-               COALESCE(
-                 ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
-                 ARRAY[]::VARCHAR[]
-               ) as topics
-        FROM articles a
-        JOIN users u ON a.user_id = u.id
-        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
-        LEFT JOIN article_topics at ON a.id = at.article_id
-        LEFT JOIN topics t ON at.topic_id = t.id
-        WHERE a.published = true
-      `;
-      
-      const params = [];
-      
-      if (debate_topic_id) {
-        query += ' AND a.debate_topic_id = $' + (params.length + 1) + ' AND a.is_debate_winner = true';
-        params.push(debate_topic_id);
-      } else {
-        query += ' AND (a.debate_topic_id IS NULL OR a.is_debate_winner = true)';
-      }
-      
-      if (featured === 'true') {
-        query += ' AND a.featured = true';
-      }
-      
-      if (parent_article_id) {
-        query += ' AND a.parent_article_id = $' + (params.length + 1);
-        params.push(parent_article_id);
-      }
-      
-      if (topicId) {
-        query += ' AND EXISTS (SELECT 1 FROM article_topics WHERE article_id = a.id AND topic_id = $' + (params.length + 1) + ')';
-        params.push(topicId);
-      }
-      
-      if (certified === 'true') {
-        query += ' AND ec.certified = true';
-      }
-      
-      query += ' GROUP BY a.id, u.display_name, u.tier, ec.certified ORDER BY a.created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
-      params.push(parseInt(limit), parseInt(offset));
-
-      const result = await pool.query(query, params);
-      cachedData = result.rows;
-      
-      // Cache for 5 minutes
-      setCachedData(cacheKey, cachedData, 5 * 60 * 1000);
+    // If debate_topic_id is specified, only include winning articles
+    if (debate_topic_id) {
+      query += ' AND a.debate_topic_id = $' + (params.length + 1) + ' AND a.is_debate_winner = true';
+      params.push(debate_topic_id);
+    } else {
+      // Otherwise, exclude all debate articles that are not winners
+      query += ' AND (a.debate_topic_id IS NULL OR a.is_debate_winner = true)';
     }
     
-    res.json({ articles: cachedData });
+    if (featured === 'true') {
+      query += ' AND a.featured = true';
+    }
+    
+    if (parent_article_id) {
+      query += ' AND a.parent_article_id = $' + (params.length + 1);
+      params.push(parent_article_id);
+    }
+    
+    if (topicId) {
+      query += ' AND EXISTS (SELECT 1 FROM article_topics WHERE article_id = a.id AND topic_id = $' + (params.length + 1) + ')';
+      params.push(topicId);
+    }
+    
+    query += ' GROUP BY a.id, u.display_name, u.tier, ec.certified ORDER BY a.created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
+    params.push(parseInt(limit), parseInt(offset));
+
+    const result = await pool.query(query, params);
+    
+    res.json({ articles: result.rows });
   } catch (error) {
     console.error('Get articles error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -2116,40 +2060,33 @@ app.get('/api/articles/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
-    const cacheKey = `article-${id}`;
-    let cachedData = getCachedData(cacheKey);
-    
-    if (!cachedData) {
-      const articleResult = await pool.query(
-        `SELECT a.id, a.title, a.content, a.published, a.featured, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
-                u.display_name, u.tier, ec.certified,
-                COALESCE(
-                  ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
-                  ARRAY[]::VARCHAR[]
-                ) as topics
-         FROM articles a
-         JOIN users u ON a.user_id = u.id
-         LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
-         LEFT JOIN article_topics at ON a.id = at.article_id
-         LEFT JOIN topics t ON at.topic_id = t.id
-         WHERE a.id = $1
-         GROUP BY a.id, u.display_name, u.tier, ec.certified`,
-        [id]
-      );
+    // First, get the article to check if it's published and who owns it
+    const articleResult = await pool.query(
+      `SELECT a.id, a.title, a.content, a.published, a.featured, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
+              u.display_name, u.tier, ec.certified,
+              COALESCE(
+                ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+                ARRAY[]::VARCHAR[]
+              ) as topics
+       FROM articles a
+       JOIN users u ON a.user_id = u.id
+       LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
+       LEFT JOIN article_topics at ON a.id = at.article_id
+       LEFT JOIN topics t ON at.topic_id = t.id
+       WHERE a.id = $1
+       GROUP BY a.id, u.display_name, u.tier, ec.certified`,
+      [id]
+    );
 
-      if (articleResult.rows.length === 0) {
-        return res.status(404).json({ error: 'Article not found' });
-      }
-
-      cachedData = articleResult.rows[0];
-      
-      // Cache for 10 minutes
-      setCachedData(cacheKey, cachedData, 10 * 60 * 1000);
+    if (articleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Article not found' });
     }
+
+    let article = articleResult.rows[0];
     
-    let article = cachedData;
-    
+    // Only show published articles to non-owners
     if (!article.published) {
+      // Check if user is the owner
       const token = req.headers['authorization']?.split(' ')[1];
       if (token) {
         try {
@@ -2166,26 +2103,28 @@ app.get('/api/articles/:id', async (req, res) => {
       }
     }
 
+    // Check if we should increment the view count
+    // We'll use a session-based approach to prevent double counting
     const sessionKey = `article_view_${id}`;
     const hasViewed = req.session[sessionKey];
     
+    // Only increment view count if article is published and not viewed in this session
     if (article.published && !hasViewed) {
       await pool.query(
         'UPDATE articles SET views = views + 1 WHERE id = $1',
         [id]
       );
       
+      // Mark as viewed in this session
       req.session[sessionKey] = true;
       
+      // Get updated view count
       const updatedViewResult = await pool.query(
         'SELECT views FROM articles WHERE id = $1',
         [id]
       );
       
       article.views = updatedViewResult.rows[0].views;
-      
-      // Update cache with new view count
-      setCachedData(cacheKey, article, 10 * 60 * 1000);
     }
 
     res.json({ article });
@@ -2203,6 +2142,7 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
     const { title, content, published, featured, topicIds = [] } = req.body;
     const userId = req.user.userId;
 
+    // Check if user owns the article
     const ownerCheck = await pool.query(
       'SELECT user_id, published as current_published, parent_article_id, debate_topic_id FROM articles WHERE id = $1',
       [id]
@@ -2220,10 +2160,12 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
     const isCounterOpinion = ownerCheck.rows[0].parent_article_id !== null;
     const isDebateOpinion = ownerCheck.rows[0].debate_topic_id !== null;
 
+    // Validate topic selection (max 3 topics)
     if (topicIds.length > 3) {
       return res.status(400).json({ error: 'You can select a maximum of 3 topics' });
     }
 
+    // Validate that all topic IDs exist
     if (topicIds.length > 0) {
       const topicCheck = await pool.query(
         'SELECT id FROM topics WHERE id = ANY($1)',
@@ -2235,6 +2177,7 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
       }
     }
 
+    // Check weekly limit only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
     if (published && !currentlyPublished && !isCounterOpinion && !isDebateOpinion) {
       const userResult = await pool.query(
         'SELECT weekly_articles_count, tier FROM users WHERE id = $1',
@@ -2249,6 +2192,7 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
       }
     }
 
+    // Update article
     const result = await pool.query(
       `UPDATE articles 
        SET title = $1, content = $2, published = $3, featured = $4, updated_at = CURRENT_TIMESTAMP
@@ -2257,11 +2201,14 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
       [title?.trim(), content?.trim(), published, featured, id]
     );
 
+    // Update article topics
+    // First, remove all existing topic associations
     await pool.query(
       'DELETE FROM article_topics WHERE article_id = $1',
       [id]
     );
 
+    // Then, add new topic associations if provided
     if (topicIds.length > 0) {
       const topicValues = topicIds.map(topicId => `(${id}, ${topicId})`).join(', ');
       await pool.query(
@@ -2269,16 +2216,13 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
       );
     }
 
+    // Update weekly count only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
     if (published && !currentlyPublished && !isCounterOpinion && !isDebateOpinion) {
       await pool.query(
         'UPDATE users SET weekly_articles_count = weekly_articles_count + 1 WHERE id = $1',
         [userId]
       );
     }
-
-    // Clear cache and notify clients
-    clearAllArticleCache();
-    notifyClients({ type: 'article_updated', article: result.rows[0] });
 
     res.json({
       message: 'Article updated successfully',
@@ -2297,6 +2241,7 @@ app.delete('/api/articles/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const userId = req.user.userId;
 
+    // Check if user owns the article
     const ownerCheck = await pool.query(
       'SELECT user_id FROM articles WHERE id = $1',
       [id]
@@ -2312,10 +2257,6 @@ app.delete('/api/articles/:id', authenticateToken, async (req, res) => {
 
     await pool.query('DELETE FROM articles WHERE id = $1', [id]);
 
-    // Clear cache and notify clients
-    clearAllArticleCache();
-    notifyClients({ type: 'article_deleted', articleId: id });
-
     res.json({ message: 'Article deleted successfully' });
 
   } catch (error) {
@@ -2326,7 +2267,7 @@ app.delete('/api/articles/:id', authenticateToken, async (req, res) => {
 
 // Editorial board routes
 
-// Get articles for editorial board
+// Get articles for editorial board (editorial board, admin, and super-admin only)
 app.get('/api/editorial/articles', authenticateEditorialBoard, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2353,12 +2294,13 @@ app.get('/api/editorial/articles', authenticateEditorialBoard, async (req, res) 
   }
 });
 
-// Toggle editorial certification
+// Toggle editorial certification (editorial board only)
 app.post('/api/editorial/articles/:id/certify', authenticateEditorialBoard, async (req, res) => {
   try {
     const { id } = req.params;
-    const { certified, expiresAt } = req.body;
+    const { certified } = req.body;
     
+    // Check if article exists
     const articleResult = await pool.query(
       'SELECT * FROM articles WHERE id = $1',
       [id]
@@ -2370,23 +2312,27 @@ app.post('/api/editorial/articles/:id/certify', authenticateEditorialBoard, asyn
     
     const article = articleResult.rows[0];
     
+    // Check if certification already exists
     const certResult = await pool.query(
       'SELECT * FROM editorial_certifications WHERE article_id = $1',
       [id]
     );
     
     if (certResult.rows.length > 0) {
+      // Update existing certification
       await pool.query(
-        'UPDATE editorial_certifications SET certified = $1, expires_at = $2, updated_at = CURRENT_TIMESTAMP WHERE article_id = $3',
-        [certified, expiresAt || null, id]
+        'UPDATE editorial_certifications SET certified = $1, updated_at = CURRENT_TIMESTAMP WHERE article_id = $2',
+        [certified, id]
       );
     } else {
+      // Create new certification
       await pool.query(
-        'INSERT INTO editorial_certifications (article_id, admin_id, certified, expires_at) VALUES ($1, $2, $3, $4)',
-        [id, req.user.userId, certified, expiresAt || null]
+        'INSERT INTO editorial_certifications (article_id, admin_id, certified) VALUES ($1, $2, $3)',
+        [id, req.user.userId, certified]
       );
     }
     
+    // Log the action
     await logAdminAction(
       req.user.userId,
       certified ? 'certify' : 'uncertify',
@@ -2394,15 +2340,6 @@ app.post('/api/editorial/articles/:id/certify', authenticateEditorialBoard, asyn
       parseInt(id),
       `${certified ? 'Certified' : 'Uncertified'} article: ${article.title}`
     );
-    
-    // Clear cache and notify clients
-    clearAllArticleCache();
-    notifyClients({ 
-      type: 'certification_changed', 
-      articleId: id, 
-      certified,
-      expiresAt 
-    });
     
     res.json({ 
       message: certified ? 'Article certified successfully' : 'Article uncertified successfully',
@@ -2416,7 +2353,7 @@ app.post('/api/editorial/articles/:id/certify', authenticateEditorialBoard, asyn
 
 // Admin routes
 
-// Get all users
+// Get all users (admin only)
 app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2436,7 +2373,7 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
   }
 });
 
-// Get user by ID
+// Get user by ID (admin only)
 app.get('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2462,17 +2399,19 @@ app.get('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
   }
 });
 
-// Update user role
+// Update user role (super-admin only)
 app.put('/api/admin/users/:id/role', authenticateSuperAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { role } = req.body;
     
+    // Validate role
     const validRoles = ['user', 'editorial-board', 'admin', 'super-admin'];
     if (!validRoles.includes(role)) {
       return res.status(400).json({ error: 'Invalid role' });
     }
     
+    // Get current user data
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1',
       [id]
@@ -2485,11 +2424,13 @@ app.put('/api/admin/users/:id/role', authenticateSuperAdmin, async (req, res) =>
     const currentUser = userResult.rows[0];
     const oldRole = currentUser.role;
     
+    // Update user role
     await pool.query(
       'UPDATE users SET role = $1 WHERE id = $2',
       [role, id]
     );
     
+    // Log the action
     await logAdminAction(
       req.user.userId,
       'update_role',
@@ -2505,15 +2446,17 @@ app.put('/api/admin/users/:id/role', authenticateSuperAdmin, async (req, res) =>
   }
 });
 
-// Delete user
+// Delete user (admin only) - soft delete
 app.delete('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     
+    // Prevent self-deletion
     if (parseInt(id) === req.user.userId) {
       return res.status(400).json({ error: 'Cannot delete your own account' });
     }
     
+    // Get user data before deletion for logging
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1',
       [id]
@@ -2525,6 +2468,7 @@ app.delete('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
     
     const user = userResult.rows[0];
     
+    // Soft delete the user
     await pool.query(
       `UPDATE users 
        SET account_status = 'soft_deleted', 
@@ -2534,6 +2478,7 @@ app.delete('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
       [id]
     );
     
+    // Log the action
     await logAdminAction(
       req.user.userId,
       'delete',
@@ -2549,7 +2494,7 @@ app.delete('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
   }
 });
 
-// Get all articles
+// Get all articles (admin and editorial board only)
 app.get('/api/admin/articles', authenticateEditorialBoard, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2576,11 +2521,12 @@ app.get('/api/admin/articles', authenticateEditorialBoard, async (req, res) => {
   }
 });
 
-// Delete article
+// Delete article (admin only)
 app.delete('/api/admin/articles/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     
+    // Get article data before deletion for logging
     const articleResult = await pool.query(
       `SELECT a.*, u.display_name as author_name 
        FROM articles a
@@ -2595,8 +2541,10 @@ app.delete('/api/admin/articles/:id', authenticateAdmin, async (req, res) => {
     
     const article = articleResult.rows[0];
     
+    // Delete article
     await pool.query('DELETE FROM articles WHERE id = $1', [id]);
     
+    // Log the action
     await logAdminAction(
       req.user.userId,
       'delete',
@@ -2605,10 +2553,6 @@ app.delete('/api/admin/articles/:id', authenticateAdmin, async (req, res) => {
       `Deleted article: ${article.title} by ${article.author_name}`
     );
     
-    // Clear cache and notify clients
-    clearAllArticleCache();
-    notifyClients({ type: 'article_deleted', articleId: id });
-    
     res.json({ message: 'Article deleted successfully' });
   } catch (error) {
     console.error('Delete article error:', error);
@@ -2616,7 +2560,7 @@ app.delete('/api/admin/articles/:id', authenticateAdmin, async (req, res) => {
   }
 });
 
-// Get audit log
+// Get audit log (super-admin only)
 app.get('/api/admin/audit-log', authenticateSuperAdmin, async (req, res) => {
   try {
     const { limit = 50, offset = 0 } = req.query;
@@ -2644,9 +2588,10 @@ app.get('/api/admin/audit-log', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
-// Get admin dashboard stats
+// Get admin dashboard stats (admin only)
 app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
   try {
+    // Get user counts by role
     const userCountsResult = await pool.query(
       `SELECT role, COUNT(*) as count
        FROM users
@@ -2654,6 +2599,7 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
        GROUP BY role`
     );
     
+    // Get article counts
     const articleCountsResult = await pool.query(
       `SELECT 
          COUNT(*) as total_articles,
@@ -2664,10 +2610,12 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id`
     );
     
+    // Get total views
     const viewsResult = await pool.query(
       'SELECT COALESCE(SUM(views), 0) as total_views FROM articles'
     );
     
+    // Get recent activity
     const recentActivityResult = await pool.query(
       `SELECT al.action, al.target_type, al.created_at, u.display_name as admin_name
        FROM audit_log al
@@ -2690,136 +2638,87 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
 
 // Debate Topics Endpoints
 
-// Get active debate topics
+// Get active debate topics (public route)
 app.get('/api/debate-topics', async (req, res) => {
   try {
     console.log('Fetching debate topics...');
     
-    const cacheKey = 'debate-topics-active';
-    let cachedData = getCachedData(cacheKey);
+    // First, delete expired debate topics and their opinions
+    console.log('Deleting expired debate topics...');
+    await pool.query(`
+      DELETE FROM articles 
+      WHERE debate_topic_id IN (
+        SELECT id FROM debate_topics WHERE expires_at <= CURRENT_TIMESTAMP
+      )
+    `);
     
-    if (!cachedData) {
-      await pool.query(`
-        DELETE FROM articles 
-        WHERE debate_topic_id IN (
-          SELECT id FROM debate_topics WHERE expires_at <= CURRENT_TIMESTAMP
-        )
-      `);
-      
-      await pool.query(`
-        DELETE FROM debate_topics 
-        WHERE expires_at <= CURRENT_TIMESTAMP
-      `);
-      
-      const result = await pool.query(`
-        SELECT dt.*, COUNT(a.id) as opinions_count
-        FROM debate_topics dt
-        LEFT JOIN articles a ON dt.id = a.debate_topic_id
-        WHERE dt.expires_at > CURRENT_TIMESTAMP
-        GROUP BY dt.id
-        ORDER BY dt.created_at DESC
-        LIMIT 3
-      `);
-      
-      cachedData = result.rows;
-      setCachedData(cacheKey, cachedData, 2 * 60 * 1000); // Cache for 2 minutes
-    }
+    await pool.query(`
+      DELETE FROM debate_topics 
+      WHERE expires_at <= CURRENT_TIMESTAMP
+    `);
     
-    console.log(`Found ${cachedData.length} debate topics`);
-    res.json({ topics: cachedData });
+    // Get active debate topics (limited to 3)
+    console.log('Querying active debate topics...');
+    const result = await pool.query(`
+      SELECT dt.*, COUNT(a.id) as opinions_count
+      FROM debate_topics dt
+      LEFT JOIN articles a ON dt.id = a.debate_topic_id
+      WHERE dt.expires_at > CURRENT_TIMESTAMP
+      GROUP BY dt.id
+      ORDER BY dt.created_at DESC
+      LIMIT 3
+    `);
+    
+    console.log(`Found ${result.rows.length} debate topics`);
+    res.json({ topics: result.rows });
   } catch (error) {
     console.error('Get debate topics error:', error);
     res.status(500).json({ error: 'Internal server error', details: error.message });
   }
 });
 
-// Get a specific debate topic and its opinions
+// Get a specific debate topic and its opinions (public route)
 app.get('/api/debate-topics/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
-    const cacheKey = `debate-topic-${id}`;
-    let cachedData = getCachedData(cacheKey);
+    // Get debate topic
+    const topicResult = await pool.query(
+      'SELECT * FROM debate_topics WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP',
+      [id]
+    );
     
-    if (!cachedData) {
-      const topicResult = await pool.query(
-        'SELECT * FROM debate_topics WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP',
-        [id]
-      );
-      
-      if (topicResult.rows.length === 0) {
-        return res.status(404).json({ error: 'Debate topic not found or expired' });
-      }
-      
-      const topic = topicResult.rows[0];
-      
-      const opinionsResult = await pool.query(`
-        SELECT a.*, u.display_name, u.tier
-        FROM articles a
-        JOIN users u ON a.user_id = u.id
-        WHERE a.debate_topic_id = $1 AND a.published = true
-        ORDER BY a.created_at DESC
-      `, [id]);
-      
-      cachedData = { topic, opinions: opinionsResult.rows };
-      setCachedData(cacheKey, cachedData, 2 * 60 * 1000);
+    if (topicResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Debate topic not found or expired' });
     }
     
-    res.json(cachedData);
+    const topic = topicResult.rows[0];
+    
+    // Get opinions for this topic
+    const opinionsResult = await pool.query(`
+      SELECT a.*, u.display_name, u.tier
+      FROM articles a
+      JOIN users u ON a.user_id = u.id
+      WHERE a.debate_topic_id = $1 AND a.published = true
+      ORDER BY a.created_at DESC
+    `, [id]);
+    
+    res.json({ 
+      topic, 
+      opinions: opinionsResult.rows 
+    });
   } catch (error) {
     console.error('Get debate topic error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Get opinions for a debate topic
+// Get opinions for a debate topic (public route)
 app.get('/api/debate-topics/:id/opinions', async (req, res) => {
   try {
     const { id } = req.params;
     
-    const cacheKey = `debate-opinions-${id}`;
-    let cachedData = getCachedData(cacheKey);
-    
-    if (!cachedData) {
-      const topicCheck = await pool.query(
-        'SELECT id FROM debate_topics WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP',
-        [id]
-      );
-      
-      if (topicCheck.rows.length === 0) {
-        return res.status(404).json({ error: 'Debate topic not found or expired' });
-      }
-      
-      const opinionsResult = await pool.query(`
-        SELECT a.*, u.display_name, u.tier
-        FROM articles a
-        JOIN users u ON a.user_id = u.id
-        WHERE a.debate_topic_id = $1 AND a.published = true
-        ORDER BY a.created_at DESC
-      `, [id]);
-      
-      cachedData = opinionsResult.rows;
-      setCachedData(cacheKey, cachedData, 2 * 60 * 1000);
-    }
-    
-    res.json({ opinions: cachedData });
-  } catch (error) {
-    console.error('Get debate opinions error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Create a new opinion for a debate topic
-app.post('/api/debate-topics/:id/opinions', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { title, content } = req.body;
-    const userId = req.user.userId;
-    
-    if (!title?.trim() || !content?.trim()) {
-      return res.status(400).json({ error: 'Title and content are required' });
-    }
-    
+    // Check if debate topic exists and is active
     const topicCheck = await pool.query(
       'SELECT id FROM debate_topics WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP',
       [id]
@@ -2829,6 +2728,45 @@ app.post('/api/debate-topics/:id/opinions', authenticateToken, async (req, res) 
       return res.status(404).json({ error: 'Debate topic not found or expired' });
     }
     
+    // Get opinions for this topic
+    const opinionsResult = await pool.query(`
+      SELECT a.*, u.display_name, u.tier
+      FROM articles a
+      JOIN users u ON a.user_id = u.id
+      WHERE a.debate_topic_id = $1 AND a.published = true
+      ORDER BY a.created_at DESC
+    `, [id]);
+    
+    res.json({ opinions: opinionsResult.rows });
+  } catch (error) {
+    console.error('Get debate opinions error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create a new opinion for a debate topic (authenticated users)
+app.post('/api/debate-topics/:id/opinions', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, content } = req.body;
+    const userId = req.user.userId;
+    
+    // Validate input
+    if (!title?.trim() || !content?.trim()) {
+      return res.status(400).json({ error: 'Title and content are required' });
+    }
+    
+    // Check if debate topic exists and is active
+    const topicCheck = await pool.query(
+      'SELECT id FROM debate_topics WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP',
+      [id]
+    );
+    
+    if (topicCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Debate topic not found or expired' });
+    }
+    
+    // Check if user has already written an opinion for this topic
     const existingOpinion = await pool.query(
       'SELECT id FROM articles WHERE debate_topic_id = $1 AND user_id = $2',
       [id, userId]
@@ -2838,16 +2776,13 @@ app.post('/api/debate-topics/:id/opinions', authenticateToken, async (req, res) 
       return res.status(400).json({ error: 'You have already written an opinion for this debate topic' });
     }
     
+    // Create the opinion as an article
     const result = await pool.query(
       `INSERT INTO articles (user_id, title, content, published, debate_topic_id)
        VALUES ($1, $2, $3, true, $4)
        RETURNING *`,
       [userId, title.trim(), content.trim(), id]
     );
-    
-    // Clear cache and notify clients
-    clearAllArticleCache();
-    notifyClients({ type: 'debate_opinion_created', article: result.rows[0] });
     
     res.status(201).json({
       message: 'Opinion created successfully',
@@ -2859,29 +2794,28 @@ app.post('/api/debate-topics/:id/opinions', authenticateToken, async (req, res) 
   }
 });
 
-// Create a new debate topic
+// Create a new debate topic (editorial board only)
 app.post('/api/debate-topics', authenticateEditorialBoard, async (req, res) => {
   try {
     const { title, description } = req.body;
     const userId = req.user.userId;
     
+    // Validate input
     if (!title?.trim() || !description?.trim()) {
       return res.status(400).json({ error: 'Title and description are required' });
     }
     
+    // Calculate expiration time (24 hours from now)
     const expiresAt = new Date();
     expiresAt.setHours(expiresAt.getHours() + 24);
     
+    // Create the debate topic
     const result = await pool.query(
       `INSERT INTO debate_topics (title, description, expires_at, created_by)
        VALUES ($1, $2, $3, $4)
        RETURNING *`,
       [title.trim(), description.trim(), expiresAt, userId]
     );
-    
-    // Clear cache and notify clients
-    clearAllArticleCache();
-    notifyClients({ type: 'debate_topic_created', topic: result.rows[0] });
     
     res.status(201).json({
       message: 'Debate topic created successfully',
@@ -2893,12 +2827,13 @@ app.post('/api/debate-topics', authenticateEditorialBoard, async (req, res) => {
   }
 });
 
-// Mark an article as a winner for a debate topic
+// Mark an article as a winner for a debate topic (editorial board only)
 app.post('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoard, async (req, res) => {
   try {
     const { id, articleId } = req.params;
     const userId = req.user.userId;
 
+    // Check if debate topic exists and is active
     const topicCheck = await pool.query(
       'SELECT id FROM debate_topics WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP',
       [id]
@@ -2908,6 +2843,7 @@ app.post('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoard
       return res.status(404).json({ error: 'Debate topic not found or expired' });
     }
 
+    // Check if article exists and belongs to the debate topic
     const articleCheck = await pool.query(
       'SELECT id FROM articles WHERE id = $1 AND debate_topic_id = $2',
       [articleId, id]
@@ -2917,6 +2853,7 @@ app.post('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoard
       return res.status(404).json({ error: 'Article not found or does not belong to this debate topic' });
     }
 
+    // Check if article is already a winner
     const existingWinner = await pool.query(
       'SELECT id FROM debate_winners WHERE debate_topic_id = $1 AND article_id = $2',
       [id, articleId]
@@ -2926,20 +2863,18 @@ app.post('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoard
       return res.status(400).json({ error: 'Article is already marked as a winner' });
     }
 
+    // Mark the article as a winner
     await pool.query(
       `INSERT INTO debate_winners (debate_topic_id, article_id, selected_by)
        VALUES ($1, $2, $3)`,
       [id, articleId, userId]
     );
 
+    // Update the article to mark it as a debate winner
     await pool.query(
       'UPDATE articles SET is_debate_winner = TRUE WHERE id = $1',
       [articleId]
     );
-
-    // Clear cache and notify clients
-    clearAllArticleCache();
-    notifyClients({ type: 'debate_winner_selected', debateTopicId: id, articleId });
 
     res.json({ message: 'Article marked as winner successfully' });
   } catch (error) {
@@ -2948,11 +2883,12 @@ app.post('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoard
   }
 });
 
-// Get winning articles for a debate topic
+// Get winning articles for a debate topic (public route)
 app.get('/api/debate-topics/:id/winners', async (req, res) => {
   try {
     const { id } = req.params;
 
+    // Check if debate topic exists
     const topicCheck = await pool.query(
       'SELECT id FROM debate_topics WHERE id = $1',
       [id]
@@ -2962,35 +2898,29 @@ app.get('/api/debate-topics/:id/winners', async (req, res) => {
       return res.status(404).json({ error: 'Debate topic not found' });
     }
 
-    const cacheKey = `debate-winners-${id}`;
-    let cachedData = getCachedData(cacheKey);
-    
-    if (!cachedData) {
-      const winnersResult = await pool.query(`
-        SELECT a.*, u.display_name, u.tier
-        FROM articles a
-        JOIN users u ON a.user_id = u.id
-        JOIN debate_winners dw ON a.id = dw.article_id
-        WHERE dw.debate_topic_id = $1 AND a.published = TRUE
-        ORDER BY dw.selected_at DESC
-      `, [id]);
-      
-      cachedData = winnersResult.rows;
-      setCachedData(cacheKey, cachedData, 5 * 60 * 1000);
-    }
+    // Get winning articles for this topic
+    const winnersResult = await pool.query(`
+      SELECT a.*, u.display_name, u.tier
+      FROM articles a
+      JOIN users u ON a.user_id = u.id
+      JOIN debate_winners dw ON a.id = dw.article_id
+      WHERE dw.debate_topic_id = $1 AND a.published = TRUE
+      ORDER BY dw.selected_at DESC
+    `, [id]);
 
-    res.json({ winners: cachedData });
+    res.json({ winners: winnersResult.rows });
   } catch (error) {
     console.error('Get debate winners error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Remove winner status from an article
+// Remove winner status from an article (editorial board only)
 app.delete('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoard, async (req, res) => {
   try {
     const { id, articleId } = req.params;
 
+    // Check if article is a winner for this debate topic
     const winnerCheck = await pool.query(
       'SELECT id FROM debate_winners WHERE debate_topic_id = $1 AND article_id = $2',
       [id, articleId]
@@ -3000,19 +2930,17 @@ app.delete('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoa
       return res.status(404).json({ error: 'Article is not marked as a winner for this debate topic' });
     }
 
+    // Remove the winner status
     await pool.query(
       'DELETE FROM debate_winners WHERE debate_topic_id = $1 AND article_id = $2',
       [id, articleId]
     );
 
+    // Update the article to mark it as not a debate winner
     await pool.query(
       'UPDATE articles SET is_debate_winner = FALSE WHERE id = $1',
       [articleId]
     );
-
-    // Clear cache and notify clients
-    clearAllArticleCache();
-    notifyClients({ type: 'debate_winner_removed', debateTopicId: id, articleId });
 
     res.json({ message: 'Winner status removed successfully' });
   } catch (error) {
@@ -3025,82 +2953,79 @@ app.delete('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoa
 app.get('/api/users/:display_name', async (req, res) => {
   try {
     const { display_name } = req.params;
+    
+    // Replace spaces with actual spaces (URL encoding will handle this)
     const decodedDisplayName = decodeURIComponent(display_name);
     
-    const cacheKey = `user-profile-${decodedDisplayName}`;
-    let cachedData = getCachedData(cacheKey);
+    // Get user info
+    const userResult = await pool.query(
+      `SELECT id, display_name, tier, role, created_at, followers
+       FROM users 
+       WHERE display_name = $1 AND account_status = 'active'`,
+      [decodedDisplayName]
+    );
     
-    if (!cachedData) {
-      const userResult = await pool.query(
-        `SELECT id, display_name, tier, role, created_at, followers
-         FROM users 
-         WHERE display_name = $1 AND account_status = 'active'`,
-        [decodedDisplayName]
-      );
-      
-      if (userResult.rows.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-      
-      const user = userResult.rows[0];
-      
-      const articlesResult = await pool.query(
-        `SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views,
-                ec.certified, a.is_debate_winner,
-                COALESCE(
-                  ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
-                  ARRAY[]::VARCHAR[]
-                ) as topics
-         FROM articles a
-         LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
-         LEFT JOIN article_topics at ON a.id = at.article_id
-         LEFT JOIN topics t ON at.topic_id = t.id
-         WHERE a.user_id = $1 AND a.published = true
-         GROUP BY a.id, ec.certified
-         ORDER BY a.created_at DESC`,
-        [user.id]
-      );
-      
-      const totalViews = articlesResult.rows.reduce((sum, article) => sum + (article.views || 0), 0);
-      const totalArticles = articlesResult.rows.length;
-      
-      let isFollowing = false;
-      const authHeader = req.headers['authorization'];
-      if (authHeader) {
-        const token = authHeader.split(' ')[1];
-        try {
-          const decoded = jwt.verify(token, process.env.JWT_SECRET);
-          const followCheck = await pool.query(
-            'SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2',
-            [decoded.userId, user.id]
-          );
-          isFollowing = followCheck.rows.length > 0;
-        } catch (err) {
-          // Token is invalid, ignore
-        }
-      }
-      
-      cachedData = {
-        user: {
-          id: user.id,
-          display_name: user.display_name,
-          tier: user.tier,
-          role: user.role,
-          created_at: user.created_at,
-          followers: user.followers || 0,
-          isFollowing
-        },
-        articles: articlesResult.rows,
-        stats: {
-          totalArticles,
-          totalViews
-        }
-      };
-      
-      setCachedData(cacheKey, cachedData, 5 * 60 * 1000);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
     }
     
-    res.json(cachedData);
+    const user = userResult.rows[0];
+    
+    // Get user's published articles
+    const articlesResult = await pool.query(
+      `SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views,
+              ec.certified, a.is_debate_winner,
+              COALESCE(
+                ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+                ARRAY[]::VARCHAR[]
+              ) as topics
+       FROM articles a
+       LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
+       LEFT JOIN article_topics at ON a.id = at.article_id
+       LEFT JOIN topics t ON at.topic_id = t.id
+       WHERE a.user_id = $1 AND a.published = true
+       GROUP BY a.id, ec.certified
+       ORDER BY a.created_at DESC`,
+      [user.id]
+    );
+    
+    // Calculate stats
+    const totalViews = articlesResult.rows.reduce((sum, article) => sum + (article.views || 0), 0);
+    const totalArticles = articlesResult.rows.length;
+    
+    // Check if user is authenticated to determine if they're following this user
+    let isFollowing = false;
+    const authHeader = req.headers['authorization'];
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const followCheck = await pool.query(
+          'SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2',
+          [decoded.userId, user.id]
+        );
+        isFollowing = followCheck.rows.length > 0;
+      } catch (err) {
+        // Token is invalid, ignore
+      }
+    }
+    
+    res.json({
+      user: {
+        id: user.id,
+        display_name: user.display_name,
+        tier: user.tier,
+        role: user.role,
+        created_at: user.created_at,
+        followers: user.followers || 0,
+        isFollowing
+      },
+      articles: articlesResult.rows,
+      stats: {
+        totalArticles,
+        totalViews
+      }
+    });
   } catch (error) {
     console.error('Get public user profile error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -3113,6 +3038,7 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const followerId = req.user.userId;
     
+    // Check if user exists
     const userResult = await pool.query(
       'SELECT id FROM users WHERE id = $1 AND account_status = $2',
       [id, 'active']
@@ -3122,10 +3048,12 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
     
+    // Check if user is trying to follow themselves
     if (parseInt(id) === followerId) {
       return res.status(400).json({ error: 'You cannot follow yourself' });
     }
     
+    // Check if already following
     const followCheck = await pool.query(
       'SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2',
       [followerId, id]
@@ -3135,13 +3063,17 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'You are already following this user' });
     }
     
+    // Create follow relationship
     await pool.query(
       'INSERT INTO followers (follower_id, following_id) VALUES ($1, $2)',
       [followerId, id]
     );
     
-    // Clear relevant cache
-    clearCache(/^user-profile-/);
+    // REMOVE THIS LINE - The trigger will handle this automatically
+    // await pool.query(
+    //   'UPDATE users SET followers = followers + 1 WHERE id = $1',
+    //   [id]
+    // );
     
     res.json({ message: 'User followed successfully' });
   } catch (error) {
@@ -3150,12 +3082,13 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
   }
 });
 
-// Unfollow a user
+// In the unfollow endpoint (around line 3320)
 app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const followerId = req.user.userId;
     
+    // Check if user exists
     const userResult = await pool.query(
       'SELECT id FROM users WHERE id = $1 AND account_status = $2',
       [id, 'active']
@@ -3165,6 +3098,7 @@ app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
     
+    // Check if following
     const followCheck = await pool.query(
       'SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2',
       [followerId, id]
@@ -3174,13 +3108,17 @@ app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'You are not following this user' });
     }
     
+    // Remove follow relationship
     await pool.query(
       'DELETE FROM followers WHERE follower_id = $1 AND following_id = $2',
       [followerId, id]
     );
     
-    // Clear relevant cache
-    clearCache(/^user-profile-/);
+    // REMOVE THIS LINE - The trigger will handle this automatically
+    // await pool.query(
+    //   'UPDATE users SET followers = followers - 1 WHERE id = $1',
+    //   [id]
+    // );
     
     res.json({ message: 'User unfollowed successfully' });
   } catch (error) {
@@ -3189,12 +3127,13 @@ app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
   }
 });
 
-// Logout
+// Logout (client-side token removal, server-side acknowledgment)
 app.post('/api/auth/logout', authenticateToken, (req, res) => {
   res.json({ message: 'Logged out successfully' });
 });
 
-// Catch-all route for React app
+// Add this catch-all route at the very end, before the error handling middleware
+// This serves the React app for any route that doesn't match API routes
 app.get('*', (req, res) => {
   if (fs.existsSync(buildPath)) {
     res.sendFile(path.join(buildPath, 'index.html'));
@@ -3223,6 +3162,8 @@ app.listen(PORT, async () => {
     console.log('Database initialization complete. Server is ready.');
   } catch (error) {
     console.error('Failed to initialize database:', error);
+    // Continue running even if database initialization fails
+    // The tables might already exist
   }
 });
 
