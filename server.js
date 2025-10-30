@@ -1970,10 +1970,24 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
   }
 });
 
+// Replace the existing /api/articles GET endpoint in server.js (around line 1700)
+// This version fixes the disappearing certified articles issue
+
 // Get all published articles (for browse and homepage)
 app.get('/api/articles', async (req, res) => {
   try {
-    const { featured, limit = 20, offset = 0, parent_article_id, debate_topic_id, topicId } = req.query;
+    const { featured, limit = 20, offset = 0, parent_article_id, debate_topic_id, topicId, certified } = req.query;
+    
+    // DEBUG: Log the request parameters
+    console.log('GET /api/articles - Request params:', {
+      featured,
+      limit,
+      offset,
+      parent_article_id,
+      debate_topic_id,
+      topicId,
+      certified
+    });
     
     let query = `
       SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
@@ -1993,24 +2007,60 @@ app.get('/api/articles', async (req, res) => {
     
     const params = [];
     
-    // If debate_topic_id is specified, only include winning articles
+    // FIX: Only filter debate articles when specifically requesting a debate topic
+    // OR when the debate topic has expired
     if (debate_topic_id) {
-      query += ' AND a.debate_topic_id = $' + (params.length + 1) + ' AND a.is_debate_winner = true';
+      // If specifically requesting a debate topic, show only that topic's articles
+      query += ' AND a.debate_topic_id = $' + (params.length + 1);
       params.push(debate_topic_id);
+      
+      // Check if the debate topic is active
+      const debateTopicCheck = await pool.query(
+        'SELECT expires_at FROM debate_topics WHERE id = $1',
+        [debate_topic_id]
+      );
+      
+      if (debateTopicCheck.rows.length > 0) {
+        const expiresAt = new Date(debateTopicCheck.rows[0].expires_at);
+        const now = new Date();
+        
+        // If debate has expired, only show winners
+        if (expiresAt <= now) {
+          query += ' AND a.is_debate_winner = true';
+        }
+      }
     } else {
-      // Otherwise, exclude all debate articles that are not winners
-      query += ' AND (a.debate_topic_id IS NULL OR a.is_debate_winner = true)';
+      // FIX: In general browse, show all articles EXCEPT:
+      // 1. Non-winning debate articles from EXPIRED debates only
+      // Articles from active debates should be visible even if not winners yet
+      query += ` AND (
+        a.debate_topic_id IS NULL 
+        OR a.is_debate_winner = true
+        OR EXISTS (
+          SELECT 1 FROM debate_topics dt 
+          WHERE dt.id = a.debate_topic_id 
+          AND dt.expires_at > CURRENT_TIMESTAMP
+        )
+      )`;
     }
     
+    // Featured filter
     if (featured === 'true') {
       query += ' AND a.featured = true';
     }
     
+    // Certified filter (for homepage certified articles)
+    if (certified === 'true') {
+      query += ' AND ec.certified = true';
+    }
+    
+    // Parent article filter (for counter opinions)
     if (parent_article_id) {
       query += ' AND a.parent_article_id = $' + (params.length + 1);
       params.push(parent_article_id);
     }
     
+    // Topic filter
     if (topicId) {
       query += ' AND EXISTS (SELECT 1 FROM article_topics WHERE article_id = a.id AND topic_id = $' + (params.length + 1) + ')';
       params.push(topicId);
@@ -2019,12 +2069,19 @@ app.get('/api/articles', async (req, res) => {
     query += ' GROUP BY a.id, u.display_name, u.tier, ec.certified ORDER BY a.created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
     params.push(parseInt(limit), parseInt(offset));
 
+    // DEBUG: Log the final query and params
+    console.log('Executing query with params:', params);
+    
     const result = await pool.query(query, params);
+    
+    // DEBUG: Log results count and certified count
+    const certifiedCount = result.rows.filter(a => a.certified).length;
+    console.log(`GET /api/articles - Results: ${result.rows.length} total, ${certifiedCount} certified`);
     
     res.json({ articles: result.rows });
   } catch (error) {
     console.error('Get articles error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error', details: error.message });
   }
 });
 
@@ -2638,20 +2695,36 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
 
 // Debate Topics Endpoints
 
+// Replace the /api/debate-topics GET endpoint in server.js (around line 2150)
+// This version prevents deletion of certified debate articles
+
 // Get active debate topics (public route)
 app.get('/api/debate-topics', async (req, res) => {
   try {
     console.log('Fetching debate topics...');
     
-    // First, delete expired debate topics and their opinions
-    console.log('Deleting expired debate topics...');
+    // FIX: Instead of deleting expired debate articles, just mark them
+    // This preserves certified articles for the archive
+    
+    // First, mark non-winning articles from expired debates as hidden
+    console.log('Marking expired debate opinions...');
     await pool.query(`
-      DELETE FROM articles 
+      UPDATE articles 
+      SET published = false
       WHERE debate_topic_id IN (
         SELECT id FROM debate_topics WHERE expires_at <= CURRENT_TIMESTAMP
       )
+      AND is_debate_winner = false
+      AND NOT EXISTS (
+        SELECT 1 FROM editorial_certifications ec 
+        WHERE ec.article_id = articles.id 
+        AND ec.certified = true
+      )
     `);
     
+    // Only delete the debate topics themselves, not the articles
+    // This way, winning articles and certified articles remain visible
+    console.log('Archiving expired debate topics...');
     await pool.query(`
       DELETE FROM debate_topics 
       WHERE expires_at <= CURRENT_TIMESTAMP
@@ -2662,7 +2735,7 @@ app.get('/api/debate-topics', async (req, res) => {
     const result = await pool.query(`
       SELECT dt.*, COUNT(a.id) as opinions_count
       FROM debate_topics dt
-      LEFT JOIN articles a ON dt.id = a.debate_topic_id
+      LEFT JOIN articles a ON dt.id = a.debate_topic_id AND a.published = true
       WHERE dt.expires_at > CURRENT_TIMESTAMP
       GROUP BY dt.id
       ORDER BY dt.created_at DESC
