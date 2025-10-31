@@ -80,7 +80,37 @@ app.get('/apple-touch-icon.png', (req, res) => {
   if (fs.existsSync(iconPath)) {
     res.sendFile(iconPath);
   } else {
-    res.status(404).send('Apple touch icon not found');
+    // Create a simple 180x180 PNG icon as a fallback
+    try {
+      // Try to use canvas if available
+      const { createCanvas } = require('canvas');
+      const canvas = createCanvas(180, 180);
+      const ctx = canvas.getContext('2d');
+      
+      // Draw a simple icon
+      ctx.fillStyle = '#4F46E5'; // Indigo color
+      ctx.fillRect(0, 0, 180, 180);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold 80px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('U', 90, 90);
+      
+      // Convert to PNG and send
+      res.type('png');
+      res.send(canvas.toBuffer());
+    } catch (err) {
+      // If canvas module is not available, create a simple SVG icon
+      const svgIcon = `
+        <svg width="180" height="180" xmlns="http://www.w3.org/2000/svg">
+          <rect width="180" height="180" fill="#4F46E5"/>
+          <text x="90" y="90" font-family="Arial" font-size="80" font-weight="bold" 
+                text-anchor="middle" dominant-baseline="middle" fill="white">U</text>
+        </svg>
+      `;
+      res.setHeader('Content-Type', 'image/svg+xml');
+      res.send(svgIcon);
+    }
   }
 });
 
