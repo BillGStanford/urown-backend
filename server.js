@@ -189,6 +189,20 @@ const initDatabase = async () => {
       )
     `);
 
+    // Add ideology columns if they don't exist
+    try {
+      await pool.query(`
+        ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS ideology VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS ideology_details JSONB,
+        ADD COLUMN IF NOT EXISTS ideology_public BOOLEAN DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS ideology_updated_at TIMESTAMP
+      `);
+      console.log('Ideology columns added to users table');
+    } catch (error) {
+      console.log('Ideology columns may already exist:', error.message);
+    }
+
     // Create followers table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS followers (
@@ -1506,7 +1520,13 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, email, phone, full_name, display_name, tier, role, weekly_articles_count, weekly_reset_date, display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, created_at, followers FROM users WHERE id = $1',
+      `SELECT id, email, phone, full_name, display_name, tier, role, 
+              weekly_articles_count, weekly_reset_date, 
+              display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
+              created_at, followers,
+              ideology, ideology_details, ideology_public, ideology_updated_at
+       FROM users 
+       WHERE id = $1`,
       [req.user.userId]
     );
 
@@ -3032,7 +3052,15 @@ app.get('/api/users/:display_name', async (req, res) => {
     
     // Get user info
     const userResult = await pool.query(
-      `SELECT id, display_name, tier, role, created_at, followers
+      `SELECT id, display_name, tier, role, created_at, followers,
+              CASE 
+                WHEN ideology_public = TRUE THEN ideology 
+                ELSE NULL 
+              END as ideology,
+              CASE 
+                WHEN ideology_public = TRUE THEN ideology_details 
+                ELSE NULL 
+              END as ideology_details
        FROM users 
        WHERE display_name = $1 AND account_status = 'active'`,
       [decodedDisplayName]
@@ -3091,6 +3119,8 @@ app.get('/api/users/:display_name', async (req, res) => {
         role: user.role,
         created_at: user.created_at,
         followers: user.followers || 0,
+        ideology: user.ideology,
+        ideology_details: user.ideology_details,
         isFollowing
       },
       articles: articlesResult.rows,
@@ -3196,6 +3226,101 @@ app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
     res.json({ message: 'User unfollowed successfully' });
   } catch (error) {
     console.error('Unfollow user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update user ideology
+app.put('/api/user/ideology', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { ideology, ideology_details, ideology_public } = req.body;
+
+    // Validate input
+    if (!ideology || !ideology.trim()) {
+      return res.status(400).json({ error: 'Ideology is required' });
+    }
+
+    // Update user ideology
+    const result = await pool.query(
+      `UPDATE users 
+       SET ideology = $1, 
+           ideology_details = $2, 
+           ideology_public = $3, 
+           ideology_updated_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $4
+       RETURNING id, email, phone, full_name, display_name, tier, role, ideology, ideology_details, ideology_public, ideology_updated_at`,
+      [ideology.trim(), ideology_details ? JSON.stringify(ideology_details) : null, ideology_public, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      message: 'Ideology updated successfully',
+      user: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error('Update ideology error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get user's own ideology (including private)
+app.get('/api/user/ideology', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ideology, ideology_details, ideology_public, ideology_updated_at
+       FROM users 
+       WHERE id = $1`,
+      [req.user.userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({ ideology: result.rows[0] });
+
+  } catch (error) {
+    console.error('Get ideology error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Toggle ideology visibility
+app.put('/api/user/ideology/visibility', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { ideology_public } = req.body;
+
+    if (typeof ideology_public !== 'boolean') {
+      return res.status(400).json({ error: 'ideology_public must be a boolean' });
+    }
+
+    const result = await pool.query(
+      `UPDATE users 
+       SET ideology_public = $1, 
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING ideology_public`,
+      [ideology_public, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      message: 'Ideology visibility updated successfully',
+      ideology_public: result.rows[0].ideology_public
+    });
+
+  } catch (error) {
+    console.error('Update ideology visibility error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
