@@ -3156,13 +3156,13 @@ app.get('/api/users/:display_name', async (req, res) => {
             user.ideology_updated_at = ideologyResult.rows[0].ideology_updated_at;
           }
         } else {
-          // If it's not the user's own profile, only show ideology if it's public
-          const publicIdeologyResult = await pool.query(
-            `SELECT ideology, ideology_details, ideology_updated_at
-             FROM users 
-             WHERE id = $1 AND ideology_public = true`,
-            [user.id]
-          );
+// If it's not the user's own profile, only show ideology if it's public
+const publicIdeologyResult = await pool.query(
+  `SELECT ideology, ideology_details, ideology_updated_at
+   FROM users 
+   WHERE id = $1 AND ideology_public = true`,
+  [user.id]
+);
           
           if (publicIdeologyResult.rows.length > 0) {
             user.ideology = publicIdeologyResult.rows[0].ideology;
