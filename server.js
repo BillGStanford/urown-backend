@@ -3073,6 +3073,7 @@ app.delete('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoa
 });
 
 // Get public user profile by display name
+// Get public user profile by display name
 app.get('/api/users/:display_name', async (req, res) => {
   try {
     const { display_name } = req.params;
@@ -3080,9 +3081,10 @@ app.get('/api/users/:display_name', async (req, res) => {
     // Replace spaces with actual spaces (URL encoding will handle this)
     const decodedDisplayName = decodeURIComponent(display_name);
     
-    // Get user info
+    // Get user info - ALWAYS get ideology fields
     const userResult = await pool.query(
-      `SELECT id, display_name, tier, role, created_at, followers
+      `SELECT id, display_name, tier, role, created_at, followers,
+              ideology, ideology_details, ideology_public, ideology_updated_at
        FROM users 
        WHERE display_name = $1 AND account_status = 'active'`,
       [decodedDisplayName]
@@ -3116,10 +3118,9 @@ app.get('/api/users/:display_name', async (req, res) => {
     const totalViews = articlesResult.rows.reduce((sum, article) => sum + (article.views || 0), 0);
     const totalArticles = articlesResult.rows.length;
     
-    // Check if user is authenticated to determine if they're following this user
+    // Check if user is authenticated
     let isFollowing = false;
     let isOwnProfile = false;
-    let showIdeology = false;
     
     const authHeader = req.headers['authorization'];
     if (authHeader) {
@@ -3136,60 +3137,48 @@ app.get('/api/users/:display_name', async (req, res) => {
           [decoded.userId, user.id]
         );
         isFollowing = followCheck.rows.length > 0;
-        
-        // Only show ideology if it's public or if it's the user's own profile
-        showIdeology = isOwnProfile;
-        
-        // If it's the user's own profile, get the full ideology data
-        if (isOwnProfile) {
-          const ideologyResult = await pool.query(
-            `SELECT ideology, ideology_details, ideology_public, ideology_updated_at
-             FROM users 
-             WHERE id = $1`,
-            [user.id]
-          );
-          
-          if (ideologyResult.rows.length > 0) {
-            user.ideology = ideologyResult.rows[0].ideology;
-            user.ideology_details = ideologyResult.rows[0].ideology_details;
-            user.ideology_public = ideologyResult.rows[0].ideology_public;
-            user.ideology_updated_at = ideologyResult.rows[0].ideology_updated_at;
-          }
-        } else {
-// If it's not the user's own profile, only show ideology if it's public
-const publicIdeologyResult = await pool.query(
-  `SELECT ideology, ideology_details, ideology_updated_at
-   FROM users 
-   WHERE id = $1 AND ideology_public = true`,
-  [user.id]
-);
-          
-          if (publicIdeologyResult.rows.length > 0) {
-            user.ideology = publicIdeologyResult.rows[0].ideology;
-            user.ideology_details = publicIdeologyResult.rows[0].ideology_details;
-            user.ideology_public = true;
-            user.ideology_updated_at = publicIdeologyResult.rows[0].ideology_updated_at;
-          }
-        }
       } catch (err) {
         // Token is invalid, ignore
       }
     }
     
+    // Prepare user object for response
+    const userResponse = {
+      id: user.id,
+      display_name: user.display_name,
+      tier: user.tier,
+      role: user.role,
+      created_at: user.created_at,
+      followers: user.followers || 0,
+      isFollowing
+    };
+    
+    // CRITICAL: Only include ideology if it's public OR if viewing own profile
+    if (isOwnProfile) {
+      // User can see their own ideology regardless of public setting
+      userResponse.ideology = user.ideology;
+      userResponse.ideology_details = user.ideology_details;
+      userResponse.ideology_public = user.ideology_public;
+      userResponse.ideology_updated_at = user.ideology_updated_at;
+    } else if (user.ideology_public === true && user.ideology) {
+      // Others can only see if it's explicitly public
+      userResponse.ideology = user.ideology;
+      userResponse.ideology_details = user.ideology_details;
+      userResponse.ideology_public = true;
+      userResponse.ideology_updated_at = user.ideology_updated_at;
+    }
+    // If not own profile and not public, don't include ideology fields at all
+    
+    console.log('Sending user profile:', {
+      display_name: userResponse.display_name,
+      isOwnProfile,
+      ideology_public: user.ideology_public,
+      has_ideology: !!user.ideology,
+      sending_ideology: !!userResponse.ideology
+    });
+    
     res.json({
-      user: {
-        id: user.id,
-        display_name: user.display_name,
-        tier: user.tier,
-        role: user.role,
-        created_at: user.created_at,
-        followers: user.followers || 0,
-        ideology: user.ideology,
-        ideology_details: user.ideology_details,
-        ideology_public: user.ideology_public,
-        ideology_updated_at: user.ideology_updated_at,
-        isFollowing
-      },
+      user: userResponse,
       articles: articlesResult.rows,
       stats: {
         totalArticles,
