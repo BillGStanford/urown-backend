@@ -3082,15 +3082,7 @@ app.get('/api/users/:display_name', async (req, res) => {
     
     // Get user info
     const userResult = await pool.query(
-      `SELECT id, display_name, tier, role, created_at, followers,
-              CASE 
-                WHEN ideology_public = TRUE THEN ideology 
-                ELSE NULL 
-              END as ideology,
-              CASE 
-                WHEN ideology_public = TRUE THEN ideology_details 
-                ELSE NULL 
-              END as ideology_details
+      `SELECT id, display_name, tier, role, created_at, followers
        FROM users 
        WHERE display_name = $1 AND account_status = 'active'`,
       [decodedDisplayName]
@@ -3126,16 +3118,59 @@ app.get('/api/users/:display_name', async (req, res) => {
     
     // Check if user is authenticated to determine if they're following this user
     let isFollowing = false;
+    let isOwnProfile = false;
+    let showIdeology = false;
+    
     const authHeader = req.headers['authorization'];
     if (authHeader) {
       const token = authHeader.split(' ')[1];
       try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        
+        // Check if this is the user's own profile
+        isOwnProfile = parseInt(decoded.userId) === user.id;
+        
+        // Check if following
         const followCheck = await pool.query(
           'SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2',
           [decoded.userId, user.id]
         );
         isFollowing = followCheck.rows.length > 0;
+        
+        // Only show ideology if it's public or if it's the user's own profile
+        showIdeology = isOwnProfile;
+        
+        // If it's the user's own profile, get the full ideology data
+        if (isOwnProfile) {
+          const ideologyResult = await pool.query(
+            `SELECT ideology, ideology_details, ideology_public, ideology_updated_at
+             FROM users 
+             WHERE id = $1`,
+            [user.id]
+          );
+          
+          if (ideologyResult.rows.length > 0) {
+            user.ideology = ideologyResult.rows[0].ideology;
+            user.ideology_details = ideologyResult.rows[0].ideology_details;
+            user.ideology_public = ideologyResult.rows[0].ideology_public;
+            user.ideology_updated_at = ideologyResult.rows[0].ideology_updated_at;
+          }
+        } else {
+          // If it's not the user's own profile, only show ideology if it's public
+          const publicIdeologyResult = await pool.query(
+            `SELECT ideology, ideology_details, ideology_updated_at
+             FROM users 
+             WHERE id = $1 AND ideology_public = true`,
+            [user.id]
+          );
+          
+          if (publicIdeologyResult.rows.length > 0) {
+            user.ideology = publicIdeologyResult.rows[0].ideology;
+            user.ideology_details = publicIdeologyResult.rows[0].ideology_details;
+            user.ideology_public = true;
+            user.ideology_updated_at = publicIdeologyResult.rows[0].ideology_updated_at;
+          }
+        }
       } catch (err) {
         // Token is invalid, ignore
       }
@@ -3151,6 +3186,8 @@ app.get('/api/users/:display_name', async (req, res) => {
         followers: user.followers || 0,
         ideology: user.ideology,
         ideology_details: user.ideology_details,
+        ideology_public: user.ideology_public,
+        ideology_updated_at: user.ideology_updated_at,
         isFollowing
       },
       articles: articlesResult.rows,
@@ -3351,6 +3388,73 @@ app.put('/api/user/ideology/visibility', authenticateToken, async (req, res) => 
 
   } catch (error) {
     console.error('Update ideology visibility error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Add this after your other routes (around line 3500)
+// Debug endpoint to check ideology status
+app.get('/api/debug/ideology/:userId', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const requestorId = req.user.userId;
+    
+    // Get the user's ideology data
+    const userResult = await pool.query(
+      `SELECT id, display_name, ideology, ideology_details, ideology_public, ideology_updated_at
+       FROM users 
+       WHERE id = $1`,
+      [userId]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = userResult.rows[0];
+    
+    // Check if this is the user's own profile
+    const isOwnProfile = parseInt(requestorId) === parseInt(userId);
+    
+    // Determine what should be visible
+    let visibleIdeology = null;
+    let visibleDetails = null;
+    let visiblePublic = false;
+    
+    if (isOwnProfile) {
+      // User can always see their own ideology
+      visibleIdeology = user.ideology;
+      visibleDetails = user.ideology_details;
+      visiblePublic = user.ideology_public;
+    } else if (user.ideology_public) {
+      // Others can only see if it's public
+      visibleIdeology = user.ideology;
+      visibleDetails = user.ideology_details;
+      visiblePublic = true;
+    }
+    
+    res.json({
+      user: {
+        id: user.id,
+        display_name: user.display_name,
+        isOwnProfile,
+        requestorId
+      },
+      ideology: {
+        actual: {
+          ideology: user.ideology,
+          ideology_details: user.ideology_details,
+          ideology_public: user.ideology_public
+        },
+        visible: {
+          ideology: visibleIdeology,
+          ideology_details: visibleDetails,
+          ideology_public: visiblePublic
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Debug ideology error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
