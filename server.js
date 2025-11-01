@@ -3073,15 +3073,13 @@ app.delete('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoa
 });
 
 // Get public user profile by display name
-// Get public user profile by display name
 app.get('/api/users/:display_name', async (req, res) => {
   try {
     const { display_name } = req.params;
     
-    // Replace spaces with actual spaces (URL encoding will handle this)
     const decodedDisplayName = decodeURIComponent(display_name);
     
-    // Get user info - ALWAYS get ideology fields
+    // Get user info - ALWAYS include ideology fields
     const userResult = await pool.query(
       `SELECT id, display_name, tier, role, created_at, followers,
               ideology, ideology_details, ideology_public, ideology_updated_at
@@ -3114,11 +3112,10 @@ app.get('/api/users/:display_name', async (req, res) => {
       [user.id]
     );
     
-    // Calculate stats
     const totalViews = articlesResult.rows.reduce((sum, article) => sum + (article.views || 0), 0);
     const totalArticles = articlesResult.rows.length;
     
-    // Check if user is authenticated
+    // Check authentication (if user is logged in)
     let isFollowing = false;
     let isOwnProfile = false;
     
@@ -3127,8 +3124,6 @@ app.get('/api/users/:display_name', async (req, res) => {
       const token = authHeader.split(' ')[1];
       try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        
-        // Check if this is the user's own profile
         isOwnProfile = parseInt(decoded.userId) === user.id;
         
         // Check if following
@@ -3138,11 +3133,11 @@ app.get('/api/users/:display_name', async (req, res) => {
         );
         isFollowing = followCheck.rows.length > 0;
       } catch (err) {
-        // Token is invalid, ignore
+        // Invalid token, treat as not logged in
       }
     }
     
-    // Prepare user object for response
+    // Prepare user response
     const userResponse = {
       id: user.id,
       display_name: user.display_name,
@@ -3153,27 +3148,27 @@ app.get('/api/users/:display_name', async (req, res) => {
       isFollowing
     };
     
-    // CRITICAL: Only include ideology if it's public OR if viewing own profile
+    // CRITICAL FIX: Add ideology fields regardless of authentication
+    // If it's the user's own profile, show everything
     if (isOwnProfile) {
-      // User can see their own ideology regardless of public setting
       userResponse.ideology = user.ideology;
       userResponse.ideology_details = user.ideology_details;
       userResponse.ideology_public = user.ideology_public;
       userResponse.ideology_updated_at = user.ideology_updated_at;
-    } else if (user.ideology_public === true && user.ideology) {
-      // Others can only see if it's explicitly public
+    } 
+    // If ideology is public, show it to EVERYONE (logged in or not)
+    else if (user.ideology_public === true && user.ideology) {
       userResponse.ideology = user.ideology;
       userResponse.ideology_details = user.ideology_details;
       userResponse.ideology_public = true;
       userResponse.ideology_updated_at = user.ideology_updated_at;
     }
-    // If not own profile and not public, don't include ideology fields at all
     
-    console.log('Sending user profile:', {
+    console.log('Public profile response:', {
       display_name: userResponse.display_name,
+      hasAuth: !!authHeader,
       isOwnProfile,
       ideology_public: user.ideology_public,
-      has_ideology: !!user.ideology,
       sending_ideology: !!userResponse.ideology
     });
     
