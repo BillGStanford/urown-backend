@@ -3359,7 +3359,7 @@ app.get('/api/user/ideology', authenticateToken, async (req, res) => {
 });
 
 // Toggle ideology visibility
-app.put('/api/user/ideology/visibility', authenticateToken, async (req, res) => {
+app.patch('/api/user/ideology/visibility', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { ideology_public } = req.body;
