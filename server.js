@@ -292,19 +292,6 @@ const initDatabase = async () => {
       )
     `);
 
-    // Create article_views table for tracking unique views
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS article_views (
-        id SERIAL PRIMARY KEY,
-        article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
-        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-        fingerprint VARCHAR(255),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(article_id, user_id),
-        UNIQUE(article_id, fingerprint)
-      )
-    `);
-
     // Create session table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS session (
@@ -2223,85 +2210,34 @@ app.get('/api/articles/:id', async (req, res) => {
       }
     }
 
-    res.json({ article });
-
-  } catch (error) {
-    console.error('Get article error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Record article view
-app.post('/api/articles/:id/view', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { fingerprint } = req.body;
+    // Check if we should increment the view count
+    // We'll use a session-based approach to prevent double counting
+    const sessionKey = `article_view_${id}`;
+    const hasViewed = req.session[sessionKey];
     
-    // Check if article exists and is published
-    const articleResult = await pool.query(
-      'SELECT id, published FROM articles WHERE id = $1',
-      [id]
-    );
-    
-    if (articleResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Article not found' });
-    }
-    
-    const article = articleResult.rows[0];
-    
-    if (!article.published) {
-      return res.status(403).json({ error: 'Article is not published' });
-    }
-    
-    let userId = null;
-    
-    // Check if user is authenticated
-    const authHeader = req.headers['authorization'];
-    if (authHeader) {
-      const token = authHeader.split(' ')[1];
-      try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        userId = decoded.userId;
-      } catch (err) {
-        // Invalid token, continue without user ID
-      }
-    }
-    
-    // Check if this view has already been recorded
-    let viewExists = false;
-    
-    if (userId) {
-      // Check by user ID
-      const userViewResult = await pool.query(
-        'SELECT id FROM article_views WHERE article_id = $1 AND user_id = $2',
-        [id, userId]
-      );
-      viewExists = userViewResult.rows.length > 0;
-    } else if (fingerprint) {
-      // Check by fingerprint
-      const fingerprintViewResult = await pool.query(
-        'SELECT id FROM article_views WHERE article_id = $1 AND fingerprint = $2',
-        [id, fingerprint]
-      );
-      viewExists = fingerprintViewResult.rows.length > 0;
-    }
-    
-    // If view doesn't exist, record it and increment count
-    if (!viewExists) {
-      await pool.query(
-        'INSERT INTO article_views (article_id, user_id, fingerprint) VALUES ($1, $2, $3)',
-        [id, userId, fingerprint || null]
-      );
-      
+    // Only increment view count if article is published and not viewed in this session
+    if (article.published && !hasViewed) {
       await pool.query(
         'UPDATE articles SET views = views + 1 WHERE id = $1',
         [id]
       );
+      
+      // Mark as viewed in this session
+      req.session[sessionKey] = true;
+      
+      // Get updated view count
+      const updatedViewResult = await pool.query(
+        'SELECT views FROM articles WHERE id = $1',
+        [id]
+      );
+      
+      article.views = updatedViewResult.rows[0].views;
     }
-    
-    res.json({ success: true, viewExists });
+
+    res.json({ article });
+
   } catch (error) {
-    console.error('Record view error:', error);
+    console.error('Get article error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
