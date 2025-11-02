@@ -3443,6 +3443,86 @@ app.get('/api/debug/ideology/:userId', authenticateToken, async (req, res) => {
   }
 });
 
+// Create article (admin only)
+app.post('/api/admin/articles/create', authenticateAdmin, async (req, res) => {
+  try {
+    const { username, title, content, topicIds = [] } = req.body;
+    const adminId = req.user.userId;
+
+    // Validate input
+    if (!title?.trim() || !content?.trim()) {
+      return res.status(400).json({ error: 'Title and content are required' });
+    }
+
+    if (title.length > 255) {
+      return res.status(400).json({ error: 'Title must be 255 characters or less' });
+    }
+
+    // Find the user by username
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE display_name = $1 AND account_status = $2',
+      [username, 'active']
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userId = userResult.rows[0].id;
+
+    // Validate topic selection (max 3 topics)
+    if (topicIds.length > 3) {
+      return res.status(400).json({ error: 'You can select a maximum of 3 topics' });
+    }
+
+    // Validate that all topic IDs exist
+    if (topicIds.length > 0) {
+      const topicCheck = await pool.query(
+        'SELECT id FROM topics WHERE id = ANY($1)',
+        [topicIds]
+      );
+      
+      if (topicCheck.rows.length !== topicIds.length) {
+        return res.status(400).json({ error: 'One or more selected topics are invalid' });
+      }
+    }
+
+    // Create article
+    const result = await pool.query(
+      'INSERT INTO articles (user_id, title, content, published) VALUES ($1, $2, $3, true) RETURNING *',
+      [userId, title.trim(), content.trim()]
+    );
+
+    const article = result.rows[0];
+
+    // Link article with topics if provided
+    if (topicIds.length > 0) {
+      const topicValues = topicIds.map(topicId => `(${article.id}, ${topicId})`).join(', ');
+      await pool.query(
+        `INSERT INTO article_topics (article_id, topic_id) VALUES ${topicValues}`
+      );
+    }
+
+    // Log the action
+    await logAdminAction(
+      adminId,
+      'create_article',
+      'article',
+      article.id,
+      `Created article "${title}" on behalf of ${username}`
+    );
+
+    res.status(201).json({
+      message: 'Article published successfully',
+      article
+    });
+
+  } catch (error) {
+    console.error('Create article error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Logout (client-side token removal, server-side acknowledgment)
 app.post('/api/auth/logout', authenticateToken, (req, res) => {
   res.json({ message: 'Logged out successfully' });
