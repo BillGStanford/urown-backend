@@ -393,6 +393,117 @@ const initDatabase = async () => {
       )
     `);
 
+    // Create notifications table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(50) NOT NULL,
+        message TEXT NOT NULL,
+        link VARCHAR(500),
+        read BOOLEAN DEFAULT FALSE,
+        deletion_starts_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create index for faster queries
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
+      CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
+    `);
+
+    // Create trigger function to create notification on new follower
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION notify_new_follower()
+      RETURNS TRIGGER AS $$       BEGIN
+        INSERT INTO notifications (user_id, type, message, link)
+        VALUES (
+          NEW.following_id,
+          'new_follower',
+          (SELECT display_name FROM users WHERE id = NEW.follower_id) || ' started following you!',
+          '/user/' || (SELECT display_name FROM users WHERE id = NEW.follower_id)
+        );
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    await pool.query(`
+      DROP TRIGGER IF EXISTS trigger_new_follower ON followers;
+      CREATE TRIGGER trigger_new_follower
+      AFTER INSERT ON followers
+      FOR EACH ROW
+      EXECUTE FUNCTION notify_new_follower();
+    `);
+
+    // Create trigger function to create notification on counter argument
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION notify_counter_argument()
+      RETURNS TRIGGER AS $$       DECLARE
+        parent_user_id INTEGER;
+        parent_title TEXT;
+      BEGIN
+        IF NEW.parent_article_id IS NOT NULL THEN
+          SELECT user_id, title INTO parent_user_id, parent_title
+          FROM articles WHERE id = NEW.parent_article_id;
+          
+          IF parent_user_id IS NOT NULL AND parent_user_id != NEW.user_id THEN
+            INSERT INTO notifications (user_id, type, message, link)
+            VALUES (
+              parent_user_id,
+              'counter_argument',
+              (SELECT display_name FROM users WHERE id = NEW.user_id) || 
+              ' wrote a counter-argument to your article "' || 
+              SUBSTRING(parent_title, 1, 50) || 
+              CASE WHEN LENGTH(parent_title) > 50 THEN '..."' ELSE '"' END,
+              '/article/' || NEW.id
+            );
+          END IF;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    await pool.query(`
+      DROP TRIGGER IF EXISTS trigger_counter_argument ON articles;
+      CREATE TRIGGER trigger_counter_argument
+      AFTER INSERT ON articles
+      FOR EACH ROW
+      EXECUTE FUNCTION notify_counter_argument();
+    `);
+
+    // Create trigger function to notify followers of new posts
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION notify_followers_new_post()
+      RETURNS TRIGGER AS $$       BEGIN
+        IF NEW.published = TRUE AND NEW.parent_article_id IS NULL AND NEW.debate_topic_id IS NULL THEN
+          INSERT INTO notifications (user_id, type, message, link)
+          SELECT 
+            f.follower_id,
+            'following_post',
+            (SELECT display_name FROM users WHERE id = NEW.user_id) || 
+            ' published a new article: "' || 
+            SUBSTRING(NEW.title, 1, 50) || 
+            CASE WHEN LENGTH(NEW.title) > 50 THEN '..."' ELSE '"' END,
+            '/article/' || NEW.id
+          FROM followers f
+          WHERE f.following_id = NEW.user_id;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    await pool.query(`
+      DROP TRIGGER IF EXISTS trigger_followers_new_post ON articles;
+      CREATE TRIGGER trigger_followers_new_post
+      AFTER INSERT ON articles
+      FOR EACH ROW
+      EXECUTE FUNCTION notify_followers_new_post();
+    `);
+
     // Insert default topics if they don't exist
     const defaultTopics = [
       'Politics', 'Business', 'Finance', 'Sports', 'Food', 'Travel',
@@ -3523,6 +3634,158 @@ app.post('/api/admin/articles/create', authenticateAdmin, async (req, res) => {
   }
 });
 
+// Notification routes
+
+// Get user notifications
+app.get('/api/notifications', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const result = await pool.query(
+      `SELECT * FROM notifications 
+       WHERE user_id = $1 
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+    
+    res.json({ notifications: result.rows });
+  } catch (error) {
+    console.error('Get notifications error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get unread notification count
+app.get('/api/notifications/unread-count', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const result = await pool.query(
+      'SELECT COUNT(*) as count FROM notifications WHERE user_id = $1 AND read = FALSE',
+      [userId]
+    );
+    
+    res.json({ count: parseInt(result.rows[0].count) });
+  } catch (error) {
+    console.error('Get unread count error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Mark notification as read
+app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    
+    // Check if notification belongs to user
+    const notifCheck = await pool.query(
+      'SELECT id FROM notifications WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+    
+    if (notifCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+    
+    // Mark as read and set deletion timer
+    await pool.query(
+      `UPDATE notifications 
+       SET read = TRUE, deletion_starts_at = CURRENT_TIMESTAMP 
+       WHERE id = $1`,
+      [id]
+    );
+    
+    res.json({ message: 'Notification marked as read' });
+  } catch (error) {
+    console.error('Mark notification as read error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Mark all notifications as read
+app.put('/api/notifications/mark-all-read', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    await pool.query(
+      `UPDATE notifications 
+       SET read = TRUE, deletion_starts_at = CURRENT_TIMESTAMP 
+       WHERE user_id = $1 AND read = FALSE`,
+      [userId]
+    );
+    
+    res.json({ message: 'All notifications marked as read' });
+  } catch (error) {
+    console.error('Mark all as read error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete a specific notification
+app.delete('/api/notifications/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    
+    // Check if notification belongs to user
+    const notifCheck = await pool.query(
+      'SELECT id FROM notifications WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+    
+    if (notifCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+    
+    await pool.query('DELETE FROM notifications WHERE id = $1', [id]);
+    
+    res.json({ message: 'Notification deleted' });
+  } catch (error) {
+    console.error('Delete notification error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete all read notifications
+app.delete('/api/notifications/delete-all-read', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    await pool.query(
+      'DELETE FROM notifications WHERE user_id = $1 AND read = TRUE',
+      [userId]
+    );
+    
+    res.json({ message: 'Read notifications deleted' });
+  } catch (error) {
+    console.error('Delete read notifications error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Cleanup job - Delete notifications that have been read for 5+ minutes
+// This should be called periodically (add to a cron job or run manually)
+app.post('/api/admin/cleanup-notifications', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      DELETE FROM notifications 
+      WHERE read = TRUE 
+      AND deletion_starts_at IS NOT NULL 
+      AND deletion_starts_at <= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+      RETURNING id
+    `);
+    
+    res.json({ 
+      message: 'Notification cleanup completed',
+      deleted: result.rows.length
+    });
+  } catch (error) {
+    console.error('Cleanup notifications error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Logout (client-side token removal, server-side acknowledgment)
 app.post('/api/auth/logout', authenticateToken, (req, res) => {
   res.json({ message: 'Logged out successfully' });
@@ -3548,6 +3811,25 @@ app.use((err, req, res, next) => {
 app.use('/api/*', (req, res) => {
   res.status(404).json({ error: 'API route not found' });
 });
+
+// Auto-cleanup notifications every minute
+setInterval(async () => {
+  try {
+    const result = await pool.query(`
+      DELETE FROM notifications 
+      WHERE read = TRUE 
+      AND deletion_starts_at IS NOT NULL 
+      AND deletion_starts_at <= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+      RETURNING id
+    `);
+    
+    if (result.rows.length > 0) {
+      console.log(`Auto-cleaned ${result.rows.length} read notifications`);
+    }
+  } catch (error) {
+    console.error('Auto-cleanup error:', error);
+  }
+}, 60000); // Run every minute
 
 // Start server
 app.listen(PORT, async () => {
