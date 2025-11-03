@@ -413,6 +413,26 @@ const initDatabase = async () => {
       CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
     `);
 
+    // Create bookmarks table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bookmarks (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, article_id)
+      )
+    `);
+
+    // Create indexes for faster queries
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_bookmarks_user_id ON bookmarks(user_id);
+      CREATE INDEX IF NOT EXISTS idx_bookmarks_article_id ON bookmarks(article_id);
+      CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at ON bookmarks(created_at DESC);
+    `);
+
+    console.log('Bookmarks table initialized successfully');
+
     // Create trigger function to create notification on new follower
     await pool.query(`
       CREATE OR REPLACE FUNCTION notify_new_follower()
@@ -3782,6 +3802,140 @@ app.post('/api/admin/cleanup-notifications', authenticateAdmin, async (req, res)
     });
   } catch (error) {
     console.error('Cleanup notifications error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Bookmark routes
+
+// Get user's bookmarked articles
+app.get('/api/bookmarks', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const result = await pool.query(
+      `SELECT 
+        a.id, a.title, a.content, a.created_at, a.updated_at, a.views,
+        u.display_name, u.tier,
+        ec.certified, a.is_debate_winner,
+        b.created_at as bookmarked_at,
+        COALESCE(
+          ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+          ARRAY[]::VARCHAR[]
+        ) as topics
+       FROM bookmarks b
+       JOIN articles a ON b.article_id = a.id
+       JOIN users u ON a.user_id = u.id
+       LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
+       LEFT JOIN article_topics at ON a.id = at.article_id
+       LEFT JOIN topics t ON at.topic_id = t.id
+       WHERE b.user_id = $1 AND a.published = true
+       GROUP BY a.id, u.display_name, u.tier, ec.certified, b.created_at
+       ORDER BY b.created_at DESC`,
+      [userId]
+    );
+    
+    res.json({ bookmarks: result.rows });
+  } catch (error) {
+    console.error('Get bookmarks error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Check if article is bookmarked
+app.get('/api/articles/:id/bookmark', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    
+    const result = await pool.query(
+      'SELECT id FROM bookmarks WHERE user_id = $1 AND article_id = $2',
+      [userId, id]
+    );
+    
+    res.json({ bookmarked: result.rows.length > 0 });
+  } catch (error) {
+    console.error('Check bookmark error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Add bookmark
+app.post('/api/articles/:id/bookmark', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    
+    const articleCheck = await pool.query(
+      'SELECT id FROM articles WHERE id = $1 AND published = true',
+      [id]
+    );
+    
+    if (articleCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Article not found' });
+    }
+    
+    const existingBookmark = await pool.query(
+      'SELECT id FROM bookmarks WHERE user_id = $1 AND article_id = $2',
+      [userId, id]
+    );
+    
+    if (existingBookmark.rows.length > 0) {
+      return res.status(400).json({ error: 'Article already bookmarked' });
+    }
+    
+    await pool.query(
+      'INSERT INTO bookmarks (user_id, article_id) VALUES ($1, $2)',
+      [userId, id]
+    );
+    
+    res.status(201).json({ message: 'Article bookmarked successfully' });
+  } catch (error) {
+    console.error('Add bookmark error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Remove bookmark
+app.delete('/api/articles/:id/bookmark', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    
+    const bookmarkCheck = await pool.query(
+      'SELECT id FROM bookmarks WHERE user_id = $1 AND article_id = $2',
+      [userId, id]
+    );
+    
+    if (bookmarkCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Bookmark not found' });
+    }
+    
+    await pool.query(
+      'DELETE FROM bookmarks WHERE user_id = $1 AND article_id = $2',
+      [userId, id]
+    );
+    
+    res.json({ message: 'Bookmark removed successfully' });
+  } catch (error) {
+    console.error('Remove bookmark error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get bookmark count for user
+app.get('/api/bookmarks/count', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const result = await pool.query(
+      'SELECT COUNT(*) as count FROM bookmarks WHERE user_id = $1',
+      [userId]
+    );
+    
+    res.json({ count: parseInt(result.rows[0].count) });
+  } catch (error) {
+    console.error('Get bookmark count error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
