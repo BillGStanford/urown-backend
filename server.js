@@ -316,6 +316,13 @@ const initDatabase = async () => {
       )
     `);
 
+    // Add anonymous_username column to articles table
+    await pool.query(`
+      ALTER TABLE articles 
+      ADD COLUMN IF NOT EXISTS anonymous_username VARCHAR(100)
+    `);
+    console.log('Added anonymous_username column to articles table');
+
     // Create session table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS session (
@@ -2230,15 +2237,18 @@ app.get('/api/articles', async (req, res) => {
     const { featured, limit = 20, offset = 0, parent_article_id, debate_topic_id, topicId, certified } = req.query;
     
     let query = `
-      SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
-             u.display_name, u.tier,
-             a.featured, ec.certified, a.is_debate_winner,
-             COALESCE(
-               ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
-               ARRAY[]::VARCHAR[]
-             ) as topics
+      SELECT 
+        a.id, a.title, a.content, a.created_at, a.updated_at, a.views, 
+        a.parent_article_id, a.debate_topic_id,
+        COALESCE(u.display_name, a.anonymous_username, 'Anonymous') as display_name,
+        COALESCE(u.tier, 'Guest') as tier,
+        a.featured, ec.certified, a.is_debate_winner,
+        COALESCE(
+          ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+          ARRAY[]::VARCHAR[]
+        ) as topics
       FROM articles a
-      JOIN users u ON a.user_id = u.id
+      LEFT JOIN users u ON a.user_id = u.id
       LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
       LEFT JOIN article_topics at ON a.id = at.article_id
       LEFT JOIN topics t ON at.topic_id = t.id
@@ -2247,14 +2257,10 @@ app.get('/api/articles', async (req, res) => {
     
     const params = [];
     
-    // FIX: Only filter debate articles when specifically requesting a debate topic
-    // OR when the debate topic has expired
     if (debate_topic_id) {
-      // If specifically requesting a debate topic, show only that topic's articles
       query += ' AND a.debate_topic_id = $' + (params.length + 1);
       params.push(debate_topic_id);
       
-      // Check if the debate topic is active
       const debateTopicCheck = await pool.query(
         'SELECT expires_at FROM debate_topics WHERE id = $1',
         [debate_topic_id]
@@ -2264,15 +2270,11 @@ app.get('/api/articles', async (req, res) => {
         const expiresAt = new Date(debateTopicCheck.rows[0].expires_at);
         const now = new Date();
         
-        // If debate has expired, only show winners
         if (expiresAt <= now) {
           query += ' AND a.is_debate_winner = true';
         }
       }
     } else {
-      // FIX: In general browse, show all articles EXCEPT:
-      // 1. Non-winning debate articles from EXPIRED debates only
-      // Articles from active debates should be visible even if not winners yet
       query += ` AND (
         a.debate_topic_id IS NULL 
         OR a.is_debate_winner = true
@@ -2284,23 +2286,19 @@ app.get('/api/articles', async (req, res) => {
       )`;
     }
     
-    // Featured filter
     if (featured === 'true') {
       query += ' AND a.featured = true';
     }
     
-    // Certified filter (for homepage certified articles)
     if (certified === 'true') {
       query += ' AND ec.certified = true';
     }
     
-    // Parent article filter (for counter opinions)
     if (parent_article_id) {
       query += ' AND a.parent_article_id = $' + (params.length + 1);
       params.push(parent_article_id);
     }
     
-    // Topic filter
     if (topicId) {
       query += ' AND EXISTS (SELECT 1 FROM article_topics WHERE article_id = a.id AND topic_id = $' + (params.length + 1) + ')';
       params.push(topicId);
@@ -2350,16 +2348,20 @@ app.get('/api/articles/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
-    // First, get the article to check if it's published and who owns it
+    // Get article with anonymous username support
     const articleResult = await pool.query(
-      `SELECT a.id, a.title, a.content, a.published, a.featured, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
-              u.display_name, u.tier, ec.certified,
-              COALESCE(
-                ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
-                ARRAY[]::VARCHAR[]
-              ) as topics
+      `SELECT 
+        a.id, a.title, a.content, a.published, a.featured, a.created_at, a.updated_at, 
+        a.views, a.parent_article_id, a.debate_topic_id,
+        COALESCE(u.display_name, a.anonymous_username, 'Anonymous') as display_name,
+        COALESCE(u.tier, 'Guest') as tier,
+        ec.certified,
+        COALESCE(
+          ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+          ARRAY[]::VARCHAR[]
+        ) as topics
        FROM articles a
-       JOIN users u ON a.user_id = u.id
+       LEFT JOIN users u ON a.user_id = u.id
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
        LEFT JOIN article_topics at ON a.id = at.article_id
        LEFT JOIN topics t ON at.topic_id = t.id
@@ -2376,7 +2378,6 @@ app.get('/api/articles/:id', async (req, res) => {
     
     // Only show published articles to non-owners
     if (!article.published) {
-      // Check if user is the owner
       const token = req.headers['authorization']?.split(' ')[1];
       if (token) {
         try {
@@ -2393,32 +2394,18 @@ app.get('/api/articles/:id', async (req, res) => {
       }
     }
 
-    // Check if we should increment the view count
-    // We'll use a session-based approach to prevent double counting
+    // Increment view count for published articles
     const sessionKey = `article_view_${id}`;
     const hasViewed = req.session[sessionKey];
     
-    // Only increment view count if article is published and not viewed in this session
     if (article.published && !hasViewed) {
-      await pool.query(
-        'UPDATE articles SET views = views + 1 WHERE id = $1',
-        [id]
-      );
-      
-      // Mark as viewed in this session
+      await pool.query('UPDATE articles SET views = views + 1 WHERE id = $1', [id]);
       req.session[sessionKey] = true;
-      
-      // Get updated view count
-      const updatedViewResult = await pool.query(
-        'SELECT views FROM articles WHERE id = $1',
-        [id]
-      );
-      
+      const updatedViewResult = await pool.query('SELECT views FROM articles WHERE id = $1', [id]);
       article.views = updatedViewResult.rows[0].views;
     }
 
     res.json({ article });
-
   } catch (error) {
     console.error('Get article error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -2931,7 +2918,7 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
 // Get active debate topics (public route)
 app.get('/api/debate-topics', async (req, res) => {
   try {
-    // FIX: Instead of deleting expired debate articles, just mark them
+    // Instead of deleting expired debate articles, just mark them
     // This preserves certified articles for the archive
     
     // First, mark non-winning articles from expired debates as hidden
@@ -2993,9 +2980,12 @@ app.get('/api/debate-topics/:id', async (req, res) => {
     
     // Get opinions for this topic
     const opinionsResult = await pool.query(`
-      SELECT a.*, u.display_name, u.tier
+      SELECT 
+        a.*,
+        COALESCE(u.display_name, a.anonymous_username, 'Anonymous') as display_name,
+        COALESCE(u.tier, 'Guest') as tier
       FROM articles a
-      JOIN users u ON a.user_id = u.id
+      LEFT JOIN users u ON a.user_id = u.id
       WHERE a.debate_topic_id = $1 AND a.published = true
       ORDER BY a.created_at DESC
     `, [id]);
@@ -3025,11 +3015,14 @@ app.get('/api/debate-topics/:id/opinions', async (req, res) => {
       return res.status(404).json({ error: 'Debate topic not found or expired' });
     }
     
-    // Get opinions for this topic
+    // Get opinions for this topic - include anonymous_username
     const opinionsResult = await pool.query(`
-      SELECT a.*, u.display_name, u.tier
+      SELECT 
+        a.*,
+        COALESCE(u.display_name, a.anonymous_username, 'Anonymous') as display_name,
+        COALESCE(u.tier, 'Guest') as tier
       FROM articles a
-      JOIN users u ON a.user_id = u.id
+      LEFT JOIN users u ON a.user_id = u.id
       WHERE a.debate_topic_id = $1 AND a.published = true
       ORDER BY a.created_at DESC
     `, [id]);
@@ -3041,16 +3034,72 @@ app.get('/api/debate-topics/:id/opinions', async (req, res) => {
   }
 });
 
-// Create a new opinion for a debate topic (authenticated users)
-app.post('/api/debate-topics/:id/opinions', authenticateToken, async (req, res) => {
+// Create a new opinion for a debate topic (authenticated and anonymous users)
+app.post('/api/debate-topics/:id/opinions', async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, content } = req.body;
-    const userId = req.user.userId;
+    const { title, content, anonymousUsername } = req.body;
+    
+    // Check if user is authenticated
+    const authHeader = req.headers['authorization'];
+    let userId = null;
+    let isAuthenticated = false;
+    
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.userId;
+        isAuthenticated = true;
+      } catch (err) {
+        // Token invalid, treat as anonymous
+      }
+    }
     
     // Validate input
     if (!title?.trim() || !content?.trim()) {
       return res.status(400).json({ error: 'Title and content are required' });
+    }
+
+    // Minimum content length to prevent spam
+    if (content.trim().length < 100) {
+      return res.status(400).json({ 
+        error: 'Your opinion must be at least 100 characters long. Please provide a more detailed perspective.' 
+      });
+    }
+    
+    // For anonymous users, validate username
+    if (!isAuthenticated) {
+      if (!anonymousUsername?.trim()) {
+        return res.status(400).json({ error: 'Username is required for anonymous posts' });
+      }
+
+      if (anonymousUsername.trim().length < 3) {
+        return res.status(400).json({ error: 'Username must be at least 3 characters long' });
+      }
+
+      // Check for profanity
+      const profanityList = ['fuck', 'shit', 'bitch', 'asshole', 'damn', 'crap', 'bastard', 'dick', 'pussy', 'cock', 'nigga', 'nigger', 'fag', 'retard'];
+      const lowerUsername = anonymousUsername.toLowerCase();
+      const hasProfanity = profanityList.some(word => lowerUsername.includes(word));
+      
+      if (hasProfanity) {
+        return res.status(400).json({ 
+          error: 'Username contains inappropriate language. Please choose a different username.' 
+        });
+      }
+
+      // Check if anonymous username is already used in this debate
+      const usernameCheck = await pool.query(
+        'SELECT id FROM articles WHERE debate_topic_id = $1 AND anonymous_username = $2',
+        [id, anonymousUsername.trim()]
+      );
+
+      if (usernameCheck.rows.length > 0) {
+        return res.status(400).json({ 
+          error: 'This username is already taken for this debate. Please choose a different one.' 
+        });
+      }
     }
     
     // Check if debate topic exists and is active
@@ -3063,22 +3112,24 @@ app.post('/api/debate-topics/:id/opinions', authenticateToken, async (req, res) 
       return res.status(404).json({ error: 'Debate topic not found or expired' });
     }
     
-    // Check if user has already written an opinion for this topic
-    const existingOpinion = await pool.query(
-      'SELECT id FROM articles WHERE debate_topic_id = $1 AND user_id = $2',
-      [id, userId]
-    );
-    
-    if (existingOpinion.rows.length > 0) {
-      return res.status(400).json({ error: 'You have already written an opinion for this debate topic' });
+    // Check if user has already written an opinion for this topic (for authenticated users)
+    if (isAuthenticated) {
+      const existingOpinion = await pool.query(
+        'SELECT id FROM articles WHERE debate_topic_id = $1 AND user_id = $2',
+        [id, userId]
+      );
+      
+      if (existingOpinion.rows.length > 0) {
+        return res.status(400).json({ error: 'You have already written an opinion for this debate topic' });
+      }
     }
     
     // Create the opinion as an article
     const result = await pool.query(
-      `INSERT INTO articles (user_id, title, content, published, debate_topic_id)
-       VALUES ($1, $2, $3, true, $4)
+      `INSERT INTO articles (user_id, title, content, published, debate_topic_id, anonymous_username)
+       VALUES ($1, $2, $3, true, $4, $5)
        RETURNING *`,
-      [userId, title.trim(), content.trim(), id]
+      [userId, title.trim(), content.trim(), id, !isAuthenticated ? anonymousUsername.trim() : null]
     );
     
     res.status(201).json({
