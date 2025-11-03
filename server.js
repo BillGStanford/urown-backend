@@ -652,7 +652,10 @@ const authenticateAdmin = (req, res, next) => {
       );
 
       if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
+        console.error(`User not found in database: ${req.user.userId}`);
+        return res.status(401).json({ 
+          error: 'User not found. Your session may have expired. Please log in again.' 
+        });
       }
 
       const user = result.rows[0];
@@ -3727,6 +3730,27 @@ app.post('/api/admin/articles/create', authenticateAdmin, async (req, res) => {
   }
 });
 
+// Check if current user exists in database (admin only)
+app.post('/api/admin/user-check', authenticateAdmin, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const result = await pool.query(
+      'SELECT id FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.json({ valid: false });
+    }
+    
+    res.json({ valid: true });
+  } catch (error) {
+    console.error('User check error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Notification routes
 
 // Get user notifications
@@ -3856,6 +3880,7 @@ app.delete('/api/notifications/delete-all-read', authenticateToken, async (req, 
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 // Cleanup job - Delete notifications that have been read for 5+ minutes
 // This should be called periodically (add to a cron job or run manually)
