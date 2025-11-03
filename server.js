@@ -197,6 +197,7 @@ const initDatabase = async () => {
         phone VARCHAR(20),
         full_name VARCHAR(255),
         display_name VARCHAR(100) NOT NULL UNIQUE,
+        discord_username VARCHAR(100),
         date_of_birth DATE NOT NULL,
         password_hash VARCHAR(255) NOT NULL,
         tier VARCHAR(20) DEFAULT 'Silver',
@@ -210,6 +211,7 @@ const initDatabase = async () => {
         email_updated_at TIMESTAMP,
         phone_updated_at TIMESTAMP,
         password_updated_at TIMESTAMP,
+        discord_username_updated_at TIMESTAMP,
         account_status VARCHAR(20) DEFAULT 'active',
         soft_deleted_at TIMESTAMP,
         hard_deleted_at TIMESTAMP,
@@ -218,6 +220,28 @@ const initDatabase = async () => {
         CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
       )
     `);
+
+    // Add migration to add column if it doesn't exist
+    try {
+      await pool.query(`
+        ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS discord_username VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS discord_username_updated_at TIMESTAMP
+      `);
+      console.log('Discord username columns added to users table');
+    } catch (error) {
+      console.log('Discord username columns may already exist:', error.message);
+    }
+
+    // Create index for faster lookups (optional but recommended)
+    try {
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_users_discord_username ON users(discord_username)
+      `);
+      console.log('Discord username index created');
+    } catch (error) {
+      console.log('Discord username index may already exist:', error.message);
+    }
 
     // Add ideology columns if they don't exist
     try {
@@ -1452,10 +1476,9 @@ app.delete('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
 });
 
 // Signup
-// In server.js, update the signup route
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, phone, full_name, display_name, date_of_birth, password, terms_agreed } = req.body;
+    const { email, phone, full_name, display_name, discord_username, date_of_birth, password, terms_agreed } = req.body;
     
     // Manual validation for better error messages
     const errors = {};
@@ -1480,6 +1503,11 @@ app.post('/api/auth/signup', async (req, res) => {
     // Display name validation
     if (!display_name || display_name.trim().length < 2) {
       errors.display_name = 'Display name must be at least 2 characters';
+    }
+    
+    // Discord username validation (optional)
+    if (discord_username && discord_username.trim().length > 0 && discord_username.trim().length < 2) {
+      errors.discord_username = 'Discord username must be at least 2 characters';
     }
     
     // Date of birth validation
@@ -1514,7 +1542,7 @@ app.post('/api/auth/signup', async (req, res) => {
       });
     }
     
-    // Check if email already exists
+    // Check if email or display name already exists
     const existingUser = await pool.query(
       'SELECT id FROM users WHERE email = $1 OR display_name = $2',
       [email, display_name]
@@ -1524,16 +1552,28 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ error: 'Email or display name already exists' });
     }
 
+    // Check if Discord username is already in use (if provided)
+    if (discord_username && discord_username.trim()) {
+      const existingDiscord = await pool.query(
+        'SELECT id FROM users WHERE discord_username = $1',
+        [discord_username.trim()]
+      );
+
+      if (existingDiscord.rows.length > 0) {
+        return res.status(400).json({ error: 'Discord username is already in use' });
+      }
+    }
+
     // Hash password
     const saltRounds = 12;
     const password_hash = await bcrypt.hash(password, saltRounds);
 
-    // Create user (phone and full_name are now optional)
+    // Create user
     const result = await pool.query(
-      `INSERT INTO users (email, phone, full_name, display_name, date_of_birth, password_hash, terms_agreed)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, email, phone, full_name, display_name, tier, role, created_at`,
-      [email, phone || null, full_name || null, display_name, date_of_birth, password_hash, terms_agreed]
+      `INSERT INTO users (email, phone, full_name, display_name, discord_username, date_of_birth, password_hash, terms_agreed)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, created_at`,
+      [email, phone || null, full_name || null, display_name, discord_username || null, date_of_birth, password_hash, terms_agreed]
     );
 
     const user = result.rows[0];
@@ -1554,6 +1594,7 @@ app.post('/api/auth/signup', async (req, res) => {
         phone: user.phone,
         full_name: user.full_name,
         display_name: user.display_name,
+        discord_username: user.discord_username,
         tier: user.tier,
         role: user.role,
         created_at: user.created_at
@@ -1562,7 +1603,6 @@ app.post('/api/auth/signup', async (req, res) => {
 
   } catch (error) {
     console.error('Signup error:', error);
-    // Return more detailed error information
     res.status(500).json({ 
       error: 'Internal server error', 
       details: error.message || 'An unknown error occurred during registration' 
@@ -1571,7 +1611,6 @@ app.post('/api/auth/signup', async (req, res) => {
 });
 
 // Login
-// server.js - Update the login route
 app.post('/api/auth/login', validateLogin, async (req, res) => {
   try {
     const { identifier, password } = req.body;
@@ -1661,13 +1700,15 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
         phone: user.phone,
         full_name: user.full_name,
         display_name: user.display_name,
+        discord_username: user.discord_username,
         tier: user.tier,
         role: user.role,
         weekly_articles_count: user.weekly_articles_count,
         display_name_updated_at: user.display_name_updated_at,
         email_updated_at: user.email_updated_at,
         phone_updated_at: user.phone_updated_at,
-        password_updated_at: user.password_updated_at
+        password_updated_at: user.password_updated_at,
+        discord_username_updated_at: user.discord_username_updated_at
       }
     });
 
@@ -1681,10 +1722,10 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, email, phone, full_name, display_name, tier, role, 
+      `SELECT id, email, phone, full_name, display_name, discord_username, tier, role, 
               weekly_articles_count, weekly_reset_date, 
               display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
-              created_at, followers,
+              discord_username_updated_at, created_at, followers,
               ideology, ideology_details, ideology_public, ideology_updated_at
        FROM users 
        WHERE id = $1`,
@@ -1718,11 +1759,11 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// Update user profile (display name, email, phone)
+// Update user profile (display name, email, phone, discord_username)
 app.put('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { display_name, email, phone } = req.body;
+    const { display_name, email, phone, discord_username } = req.body;
 
     // Get current user data
     const userResult = await pool.query(
@@ -1826,6 +1867,36 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
       values.push(now);
     }
 
+    // Check discord_username update
+    if (discord_username !== undefined && discord_username !== user.discord_username) {
+      const lastUpdate = user.discord_username_updated_at ? new Date(user.discord_username_updated_at) : null;
+      const daysSinceLastUpdate = lastUpdate ? Math.floor((now - lastUpdate) / (24 * 60 * 60 * 1000)) : 14;
+
+      if (daysSinceLastUpdate < 14) {
+        const daysLeft = 14 - daysSinceLastUpdate;
+        return res.status(400).json({ 
+          error: `You can change your Discord username again in ${daysLeft} day${daysLeft !== 1 ? 's' : ''}` 
+        });
+      }
+
+      // Check if discord username is already in use by another user
+      if (discord_username && discord_username.trim()) {
+        const discordCheck = await pool.query(
+          'SELECT id FROM users WHERE discord_username = $1 AND id != $2',
+          [discord_username.trim(), userId]
+        );
+
+        if (discordCheck.rows.length > 0) {
+          return res.status(400).json({ error: 'Discord username is already in use' });
+        }
+      }
+
+      updates.push(`discord_username = $${queryIndex++}`);
+      values.push(discord_username ? discord_username.trim() : null);
+      updates.push(`discord_username_updated_at = $${queryIndex++}`);
+      values.push(now);
+    }
+
     if (updates.length === 0) {
       return res.status(400).json({ error: 'No changes provided' });
     }
@@ -1838,7 +1909,9 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
       UPDATE users 
       SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP 
       WHERE id = $${queryIndex}
-      RETURNING id, email, phone, full_name, display_name, tier, role, display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, created_at
+      RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, 
+                display_name_updated_at, email_updated_at, phone_updated_at, 
+                password_updated_at, discord_username_updated_at, created_at
     `;
 
     const result = await pool.query(updateQuery, values);
@@ -2113,7 +2186,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
 
     // Get updated user data to return to client
     const updatedUserResult = await pool.query(
-      'SELECT id, email, phone, full_name, display_name, tier, role, weekly_articles_count, weekly_reset_date, display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, created_at FROM users WHERE id = $1',
+      'SELECT id, email, phone, full_name, display_name, discord_username, tier, role, weekly_articles_count, weekly_reset_date, display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, discord_username_updated_at, created_at FROM users WHERE id = $1',
       [userId]
     );
 
@@ -2151,24 +2224,10 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
   }
 });
 
-// Replace the existing /api/articles GET endpoint in server.js (around line 1700)
-// This version fixes the disappearing certified articles issue
-
 // Get all published articles (for browse and homepage)
 app.get('/api/articles', async (req, res) => {
   try {
     const { featured, limit = 20, offset = 0, parent_article_id, debate_topic_id, topicId, certified } = req.query;
-    
-    // DEBUG: Log the request parameters
-    console.log('GET /api/articles - Request params:', {
-      featured,
-      limit,
-      offset,
-      parent_article_id,
-      debate_topic_id,
-      topicId,
-      certified
-    });
     
     let query = `
       SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views, a.parent_article_id, a.debate_topic_id,
@@ -2250,14 +2309,7 @@ app.get('/api/articles', async (req, res) => {
     query += ' GROUP BY a.id, u.display_name, u.tier, ec.certified ORDER BY a.created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
     params.push(parseInt(limit), parseInt(offset));
 
-    // DEBUG: Log the final query and params
-    console.log('Executing query with params:', params);
-    
     const result = await pool.query(query, params);
-    
-    // DEBUG: Log results count and certified count
-    const certifiedCount = result.rows.filter(a => a.certified).length;
-    console.log(`GET /api/articles - Results: ${result.rows.length} total, ${certifiedCount} certified`);
     
     res.json({ articles: result.rows });
   } catch (error) {
@@ -2595,7 +2647,7 @@ app.post('/api/editorial/articles/:id/certify', authenticateEditorialBoard, asyn
 app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.tier, u.role, 
+      `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.discord_username, u.tier, u.role, 
               u.weekly_articles_count, u.created_at, u.updated_at,
               ub.ban_end, ub.reason as ban_reason
        FROM users u
@@ -2617,7 +2669,7 @@ app.get('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
     const { id } = req.params;
     
     const result = await pool.query(
-      `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.tier, u.role, 
+      `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.discord_username, u.tier, u.role, 
               u.weekly_articles_count, u.created_at, u.updated_at,
               ub.ban_end, ub.reason as ban_reason
        FROM users u
@@ -2876,19 +2928,13 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
 
 // Debate Topics Endpoints
 
-// Replace the /api/debate-topics GET endpoint in server.js (around line 2150)
-// This version prevents deletion of certified debate articles
-
 // Get active debate topics (public route)
 app.get('/api/debate-topics', async (req, res) => {
   try {
-    console.log('Fetching debate topics...');
-    
     // FIX: Instead of deleting expired debate articles, just mark them
     // This preserves certified articles for the archive
     
     // First, mark non-winning articles from expired debates as hidden
-    console.log('Marking expired debate opinions...');
     await pool.query(`
       UPDATE articles 
       SET published = false
@@ -2905,14 +2951,12 @@ app.get('/api/debate-topics', async (req, res) => {
     
     // Only delete the debate topics themselves, not the articles
     // This way, winning articles and certified articles remain visible
-    console.log('Archiving expired debate topics...');
     await pool.query(`
       DELETE FROM debate_topics 
       WHERE expires_at <= CURRENT_TIMESTAMP
     `);
     
     // Get active debate topics (limited to 3)
-    console.log('Querying active debate topics...');
     const result = await pool.query(`
       SELECT dt.*, COUNT(a.id) as opinions_count
       FROM debate_topics dt
@@ -2923,7 +2967,6 @@ app.get('/api/debate-topics', async (req, res) => {
       LIMIT 3
     `);
     
-    console.log(`Found ${result.rows.length} debate topics`);
     res.json({ topics: result.rows });
   } catch (error) {
     console.error('Get debate topics error:', error);
@@ -3210,9 +3253,9 @@ app.get('/api/users/:display_name', async (req, res) => {
     
     const decodedDisplayName = decodeURIComponent(display_name);
     
-    // Get user info - ALWAYS include ideology fields
+    // Get user info - include discord_username
     const userResult = await pool.query(
-      `SELECT id, display_name, tier, role, created_at, followers,
+      `SELECT id, display_name, discord_username, tier, role, created_at, followers,
               ideology, ideology_details, ideology_public, ideology_updated_at
        FROM users 
        WHERE display_name = $1 AND account_status = 'active'`,
@@ -3272,6 +3315,7 @@ app.get('/api/users/:display_name', async (req, res) => {
     const userResponse = {
       id: user.id,
       display_name: user.display_name,
+      discord_username: user.discord_username, // Always show Discord username on public profile
       tier: user.tier,
       role: user.role,
       created_at: user.created_at,
@@ -3279,29 +3323,20 @@ app.get('/api/users/:display_name', async (req, res) => {
       isFollowing
     };
     
-    // CRITICAL FIX: Add ideology fields regardless of authentication
-    // If it's the user's own profile, show everything
+    // Add ideology fields if applicable
     if (isOwnProfile) {
       userResponse.ideology = user.ideology;
       userResponse.ideology_details = user.ideology_details;
       userResponse.ideology_public = user.ideology_public;
       userResponse.ideology_updated_at = user.ideology_updated_at;
     } 
-    // If ideology is public, show it to EVERYONE (logged in or not)
+    // If ideology is public, show it to everyone
     else if (user.ideology_public === true && user.ideology) {
       userResponse.ideology = user.ideology;
       userResponse.ideology_details = user.ideology_details;
       userResponse.ideology_public = true;
       userResponse.ideology_updated_at = user.ideology_updated_at;
     }
-    
-    console.log('Public profile response:', {
-      display_name: userResponse.display_name,
-      hasAuth: !!authHeader,
-      isOwnProfile,
-      ideology_public: user.ideology_public,
-      sending_ideology: !!userResponse.ideology
-    });
     
     res.json({
       user: userResponse,
@@ -3354,12 +3389,6 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
       [followerId, id]
     );
     
-    // REMOVE THIS LINE - The trigger will handle this automatically
-    // await pool.query(
-    //   'UPDATE users SET followers = followers + 1 WHERE id = $1',
-    //   [id]
-    // );
-    
     res.json({ message: 'User followed successfully' });
   } catch (error) {
     console.error('Follow user error:', error);
@@ -3367,7 +3396,7 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
   }
 });
 
-// In the unfollow endpoint (around line 3320)
+// Unfollow a user
 app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -3399,12 +3428,6 @@ app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
       [followerId, id]
     );
     
-    // REMOVE THIS LINE - The trigger will handle this automatically
-    // await pool.query(
-    //   'UPDATE users SET followers = followers - 1 WHERE id = $1',
-    //   [id]
-    // );
-    
     res.json({ message: 'User unfollowed successfully' });
   } catch (error) {
     console.error('Unfollow user error:', error);
@@ -3432,7 +3455,7 @@ app.put('/api/user/ideology', authenticateToken, async (req, res) => {
            ideology_updated_at = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $4
-       RETURNING id, email, phone, full_name, display_name, tier, role, ideology, ideology_details, ideology_public, ideology_updated_at`,
+       RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, ideology, ideology_details, ideology_public, ideology_updated_at`,
       [ideology.trim(), ideology_details ? JSON.stringify(ideology_details) : null, ideology_public, userId]
     );
 
@@ -3507,7 +3530,6 @@ app.patch('/api/user/ideology/visibility', authenticateToken, async (req, res) =
   }
 });
 
-// Add this after your other routes (around line 3500)
 // Debug endpoint to check ideology status
 app.get('/api/debug/ideology/:userId', authenticateToken, async (req, res) => {
   try {
