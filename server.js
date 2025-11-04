@@ -2239,27 +2239,24 @@ app.get('/api/articles', async (req, res) => {
   try {
     const { featured, limit = 20, offset = 0, parent_article_id, debate_topic_id, topicId, certified } = req.query;
     
-let query = `
-  SELECT 
-    a.id, a.title, a.content, a.created_at, a.updated_at, a.views, 
-    a.parent_article_id, a.debate_topic_id,
-    COALESCE(u.display_name, a.anonymous_username, 'Anonymous') as display_name,
-    COALESCE(u.tier, 'Guest') as tier,
-    u.ideology as author_ideology,
-    u.ideology_details as author_ideology_details,
-    u.ideology_public as author_ideology_public,
-    a.featured, ec.certified, a.is_debate_winner,
-    COALESCE(
-      ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
-      ARRAY[]::VARCHAR[]
-    ) as topics
-  FROM articles a
-  LEFT JOIN users u ON a.user_id = u.id
-  LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
-  LEFT JOIN article_topics at ON a.id = at.article_id
-  LEFT JOIN topics t ON at.topic_id = t.id
-  WHERE a.published = true
-`;
+    let query = `
+      SELECT 
+        a.id, a.title, a.content, a.created_at, a.updated_at, a.views, 
+        a.parent_article_id, a.debate_topic_id,
+        COALESCE(u.display_name, a.anonymous_username, 'Anonymous') as display_name,
+        COALESCE(u.tier, 'Guest') as tier,
+        a.featured, ec.certified, a.is_debate_winner,
+        COALESCE(
+          ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+          ARRAY[]::VARCHAR[]
+        ) as topics
+      FROM articles a
+      LEFT JOIN users u ON a.user_id = u.id
+      LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
+      LEFT JOIN article_topics at ON a.id = at.article_id
+      LEFT JOIN topics t ON at.topic_id = t.id
+      WHERE a.published = true
+    `;
     
     const params = [];
     
@@ -2355,29 +2352,26 @@ app.get('/api/articles/:id', async (req, res) => {
     const { id } = req.params;
     
     // Get article with anonymous username support
-const articleResult = await pool.query(
-  `SELECT 
-    a.id, a.title, a.content, a.published, a.featured, a.created_at, a.updated_at, 
-    a.views, a.parent_article_id, a.debate_topic_id,
-    COALESCE(u.display_name, a.anonymous_username, 'Anonymous') as display_name,
-    COALESCE(u.tier, 'Guest') as tier,
-    u.ideology as author_ideology,
-    u.ideology_details as author_ideology_details,
-    u.ideology_public as author_ideology_public,
-    ec.certified,
-    COALESCE(
-      ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
-      ARRAY[]::VARCHAR[]
-    ) as topics
-   FROM articles a
-   LEFT JOIN users u ON a.user_id = u.id
-   LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
-   LEFT JOIN article_topics at ON a.id = at.article_id
-   LEFT JOIN topics t ON at.topic_id = t.id
-   WHERE a.id = $1
-   GROUP BY a.id, u.display_name, u.tier, u.ideology, u.ideology_details, u.ideology_public, ec.certified`,
-  [id]
-);
+    const articleResult = await pool.query(
+      `SELECT 
+        a.id, a.title, a.content, a.published, a.featured, a.created_at, a.updated_at, 
+        a.views, a.parent_article_id, a.debate_topic_id,
+        COALESCE(u.display_name, a.anonymous_username, 'Anonymous') as display_name,
+        COALESCE(u.tier, 'Guest') as tier,
+        ec.certified,
+        COALESCE(
+          ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+          ARRAY[]::VARCHAR[]
+        ) as topics
+       FROM articles a
+       LEFT JOIN users u ON a.user_id = u.id
+       LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
+       LEFT JOIN article_topics at ON a.id = at.article_id
+       LEFT JOIN topics t ON at.topic_id = t.id
+       WHERE a.id = $1
+       GROUP BY a.id, u.display_name, u.tier, ec.certified`,
+      [id]
+    );
 
     if (articleResult.rows.length === 0) {
       return res.status(404).json({ error: 'Article not found' });
