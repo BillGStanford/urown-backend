@@ -40,11 +40,20 @@ if (process.env.DATABASE_URL) {
 }
 
 // Middleware
-app.use(helmet());
+// More permissive CORS for production
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'https://urown-delta.vercel.app',
-  credentials: true
+  origin: [
+    'https://urown-delta.vercel.app',
+    'http://localhost:3000',
+    process.env.FRONTEND_URL
+  ].filter(Boolean),
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
+// Handle preflight requests
+app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 
 // Serve static files from the React app
