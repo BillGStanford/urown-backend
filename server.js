@@ -464,6 +464,78 @@ const initDatabase = async () => {
 
     console.log('Bookmarks table initialized successfully');
 
+    // ============================================
+    // REDFLAGGED TABLES
+    // ============================================
+    
+    // Create redflagged_posts table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS redflagged_posts (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        company_name VARCHAR(255) NOT NULL,
+        position VARCHAR(255),
+        experience_type VARCHAR(100) NOT NULL,
+        story TEXT NOT NULL,
+        rating_fairness INTEGER NOT NULL CHECK (rating_fairness BETWEEN 1 AND 5),
+        rating_pay INTEGER NOT NULL CHECK (rating_pay BETWEEN 1 AND 5),
+        rating_culture INTEGER NOT NULL CHECK (rating_culture BETWEEN 1 AND 5),
+        rating_management INTEGER NOT NULL CHECK (rating_management BETWEEN 1 AND 5),
+        overall_rating INTEGER GENERATED ALWAYS AS (
+          (rating_fairness + rating_pay + rating_culture + rating_management) / 4
+        ) STORED,
+        anonymous_username VARCHAR(100),
+        is_anonymous BOOLEAN DEFAULT TRUE,
+        published BOOLEAN DEFAULT TRUE,
+        flagged BOOLEAN DEFAULT FALSE,
+        flagged_reason TEXT,
+        views INTEGER DEFAULT 0,
+        reaction_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Create redflagged_reactions table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS redflagged_reactions (
+        id SERIAL PRIMARY KEY,
+        post_id INTEGER REFERENCES redflagged_posts(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        anonymous_identifier VARCHAR(255),
+        reaction_type VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CHECK (user_id IS NOT NULL OR anonymous_identifier IS NOT NULL)
+      )
+    `);
+    
+    // Create redflagged_comments table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS redflagged_comments (
+        id SERIAL PRIMARY KEY,
+        post_id INTEGER REFERENCES redflagged_posts(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        commenter_name VARCHAR(255) NOT NULL,
+        comment TEXT NOT NULL,
+        is_company_response BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create indexes for RedFlagged tables
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_redflagged_posts_company ON redflagged_posts(company_name);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_posts_published ON redflagged_posts(published);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_posts_flagged ON redflagged_posts(flagged);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_posts_created_at ON redflagged_posts(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_reactions_post_id ON redflagged_reactions(post_id);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_reactions_user_id ON redflagged_reactions(user_id);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_comments_post_id ON redflagged_comments(post_id);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_comments_created_at ON redflagged_comments(created_at DESC);
+    `);
+
+    console.log('RedFlagged tables initialized successfully');
+
     // Create trigger function to create notification on new follower
     await pool.query(`
       CREATE OR REPLACE FUNCTION notify_new_follower()
@@ -3881,7 +3953,6 @@ app.delete('/api/notifications/delete-all-read', authenticateToken, async (req, 
   }
 });
 
-
 // Cleanup job - Delete notifications that have been read for 5+ minutes
 // This should be called periodically (add to a cron job or run manually)
 app.post('/api/admin/cleanup-notifications', authenticateAdmin, async (req, res) => {
@@ -4041,6 +4112,639 @@ app.get('/api/bookmarks/count', authenticateToken, async (req, res) => {
 // Logout (client-side token removal, server-side acknowledgment)
 app.post('/api/auth/logout', authenticateToken, (req, res) => {
   res.json({ message: 'Logged out successfully' });
+});
+
+// ============================================
+// REDFLAGGED ROUTES
+// ============================================
+
+// Profanity filter
+const profanityList = [
+  'fuck', 'shit', 'bitch', 'asshole', 'damn', 'crap', 'bastard', 
+  'dick', 'pussy', 'cock', 'nigga', 'nigger', 'fag', 'retard',
+  'cunt', 'whore', 'slut', 'piss'
+];
+
+const containsProfanity = (text) => {
+  if (!text) return false;
+  const lowerText = text.toLowerCase();
+  return profanityList.some(word => lowerText.includes(word));
+};
+
+const censorUsername = (username) => {
+  if (!username) return username;
+  let censored = username;
+  profanityList.forEach(word => {
+    const regex = new RegExp(word, 'gi');
+    censored = censored.replace(regex, '*'.repeat(word.length));
+  });
+  return censored;
+};
+
+// Get all RedFlagged posts (public route with optional filters)
+app.get('/api/redflagged', async (req, res) => {
+  try {
+    const { 
+      company, 
+      experienceType, 
+      minRating, 
+      maxRating,
+      sort = 'recent', 
+      limit = 20, 
+      offset = 0 
+    } = req.query;
+    
+    let query = `
+      SELECT 
+        rf.*,
+        COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
+        COALESCE(u.tier, 'Guest') as author_tier,
+        (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
+        (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
+      FROM redflagged_posts rf
+      LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
+      WHERE rf.published = true AND rf.flagged = false
+    `;
+    
+    const params = [];
+    let paramIndex = 1;
+    
+    if (company) {
+      query += ` AND LOWER(rf.company_name) LIKE LOWER($${paramIndex})`;
+      params.push(`%${company}%`);
+      paramIndex++;
+    }
+    
+    if (experienceType) {
+      query += ` AND rf.experience_type = $${paramIndex}`;
+      params.push(experienceType);
+      paramIndex++;
+    }
+    
+    if (minRating) {
+      query += ` AND rf.overall_rating >= $${paramIndex}`;
+      params.push(parseFloat(minRating));
+      paramIndex++;
+    }
+    
+    if (maxRating) {
+      query += ` AND rf.overall_rating <= $${paramIndex}`;
+      params.push(parseFloat(maxRating));
+      paramIndex++;
+    }
+    
+    // Sort options
+    switch (sort) {
+      case 'popular':
+        query += ' ORDER BY rf.views DESC, rf.reaction_count DESC';
+        break;
+      case 'controversial':
+        query += ' ORDER BY rf.reaction_count DESC, rf.views DESC';
+        break;
+      case 'highest-rated':
+        query += ' ORDER BY rf.overall_rating DESC, rf.views DESC';
+        break;
+      case 'lowest-rated':
+        query += ' ORDER BY rf.overall_rating ASC, rf.views DESC';
+        break;
+      default: // recent
+        query += ' ORDER BY rf.created_at DESC';
+    }
+    
+    query += ` LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    
+    // Get total count for pagination
+    let countQuery = `
+      SELECT COUNT(*) as total
+      FROM redflagged_posts rf
+      WHERE rf.published = true AND rf.flagged = false
+    `;
+    
+    const countParams = [];
+    let countIndex = 1;
+    
+    if (company) {
+      countQuery += ` AND LOWER(rf.company_name) LIKE LOWER($${countIndex})`;
+      countParams.push(`%${company}%`);
+      countIndex++;
+    }
+    
+    if (experienceType) {
+      countQuery += ` AND rf.experience_type = $${countIndex}`;
+      countParams.push(experienceType);
+      countIndex++;
+    }
+    
+    if (minRating) {
+      countQuery += ` AND rf.overall_rating >= $${countIndex}`;
+      countParams.push(parseFloat(minRating));
+      countIndex++;
+    }
+    
+    if (maxRating) {
+      countQuery += ` AND rf.overall_rating <= $${countIndex}`;
+      countParams.push(parseFloat(maxRating));
+    }
+    
+    const countResult = await pool.query(countQuery, countParams);
+    
+    res.json({ 
+      posts: result.rows,
+      total: parseInt(countResult.rows[0].total)
+    });
+  } catch (error) {
+    console.error('Get RedFlagged posts error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get single RedFlagged post
+app.get('/api/redflagged/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const postResult = await pool.query(`
+      SELECT 
+        rf.*,
+        COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
+        COALESCE(u.tier, 'Guest') as author_tier,
+        (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
+        (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
+      FROM redflagged_posts rf
+      LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
+      WHERE rf.id = $1 AND rf.published = true
+    `, [id]);
+    
+    if (postResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    let post = postResult.rows[0];
+    
+    // Increment view count (session-based to prevent spam)
+    const sessionKey = `redflagged_view_${id}`;
+    const hasViewed = req.session[sessionKey];
+    
+    if (!hasViewed) {
+      await pool.query('UPDATE redflagged_posts SET views = views + 1 WHERE id = $1', [id]);
+      req.session[sessionKey] = true;
+      const updatedViewResult = await pool.query('SELECT views FROM redflagged_posts WHERE id = $1', [id]);
+      post.views = updatedViewResult.rows[0].views;
+    }
+    
+    // Get reactions breakdown
+    const reactionsResult = await pool.query(`
+      SELECT reaction_type, COUNT(*) as count
+      FROM redflagged_reactions
+      WHERE post_id = $1
+      GROUP BY reaction_type
+    `, [id]);
+    
+    // Get comments
+    const commentsResult = await pool.query(`
+      SELECT *
+      FROM redflagged_comments
+      WHERE post_id = $1
+      ORDER BY created_at DESC
+    `, [id]);
+    
+    res.json({ 
+      post,
+      reactions: reactionsResult.rows,
+      comments: commentsResult.rows
+    });
+  } catch (error) {
+    console.error('Get RedFlagged post error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create RedFlagged post (public route, optional auth)
+app.post('/api/redflagged', async (req, res) => {
+  try {
+    const { 
+      company_name, 
+      position, 
+      experience_type, 
+      story,
+      rating_fairness,
+      rating_pay,
+      rating_culture,
+      rating_management,
+      anonymous_username,
+      is_anonymous = true,
+      terms_agreed
+    } = req.body;
+    
+    // Check if user is authenticated
+    const authHeader = req.headers['authorization'];
+    let userId = null;
+    let isAuthenticated = false;
+    
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.userId;
+        isAuthenticated = true;
+      } catch (err) {
+        // Token invalid, treat as anonymous
+      }
+    }
+    
+    // Validate input
+    if (!company_name?.trim()) {
+      return res.status(400).json({ error: 'Company name is required' });
+    }
+    
+    if (!experience_type?.trim()) {
+      return res.status(400).json({ error: 'Experience type is required' });
+    }
+    
+    if (!story?.trim()) {
+      return res.status(400).json({ error: 'Your story is required' });
+    }
+    
+    if (story.trim().length < 100) {
+      return res.status(400).json({ 
+        error: 'Your story must be at least 100 characters long. Please provide more details.' 
+      });
+    }
+    
+    if (!rating_fairness || !rating_pay || !rating_culture || !rating_management) {
+      return res.status(400).json({ error: 'All ratings are required' });
+    }
+    
+    if (terms_agreed !== true) {
+      return res.status(400).json({ 
+        error: 'You must agree that you are sharing your own experience truthfully' 
+      });
+    }
+    
+    // For anonymous posts, validate username
+    let finalUsername = null;
+    if (is_anonymous || !isAuthenticated) {
+      if (!anonymous_username?.trim()) {
+        return res.status(400).json({ error: 'Username is required for anonymous posts' });
+      }
+      
+      if (anonymous_username.trim().length < 3) {
+        return res.status(400).json({ error: 'Username must be at least 3 characters long' });
+      }
+      
+      if (containsProfanity(anonymous_username)) {
+        return res.status(400).json({ 
+          error: 'Username contains inappropriate language. Please choose a different username.' 
+        });
+      }
+      
+      finalUsername = censorUsername(anonymous_username.trim());
+    }
+    
+    // Check for spam patterns
+    const spamPatterns = [
+      /(.)\1{4,}/i, // Repeated characters
+      /^[^a-zA-Z0-9]*$/i, // Only special characters
+      /https?:\/\//gi // URLs (could be refined)
+    ];
+    
+    const storyLower = story.toLowerCase();
+    if (spamPatterns.some(pattern => pattern.test(storyLower))) {
+      return res.status(400).json({ 
+        error: 'Your story appears to contain spam. Please write a genuine experience.' 
+      });
+    }
+    
+    // Create the post
+    const result = await pool.query(
+      `INSERT INTO redflagged_posts (
+        user_id, company_name, position, experience_type, story,
+        rating_fairness, rating_pay, rating_culture, rating_management,
+        anonymous_username, is_anonymous
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      RETURNING *`,
+      [
+        userId, 
+        company_name.trim(), 
+        position?.trim() || null, 
+        experience_type.trim(), 
+        story.trim(),
+        rating_fairness,
+        rating_pay,
+        rating_culture,
+        rating_management,
+        finalUsername,
+        is_anonymous || !isAuthenticated
+      ]
+    );
+    
+    res.status(201).json({
+      message: 'Post created successfully',
+      post: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Create RedFlagged post error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Add reaction to RedFlagged post
+app.post('/api/redflagged/:id/react', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reaction_type } = req.body;
+    
+    const validReactions = ['agree', 'same_experience', 'different_story', 'helpful', 'inspiring'];
+    if (!validReactions.includes(reaction_type)) {
+      return res.status(400).json({ error: 'Invalid reaction type' });
+    }
+    
+    // Check if post exists
+    const postCheck = await pool.query(
+      'SELECT id FROM redflagged_posts WHERE id = $1 AND published = true',
+      [id]
+    );
+    
+    if (postCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    // Check if user is authenticated
+    const authHeader = req.headers['authorization'];
+    let userId = null;
+    let anonymousId = null;
+    
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.userId;
+      } catch (err) {
+        // Token invalid, use anonymous
+        anonymousId = req.session.id || `anon_${Date.now()}_${Math.random()}`;
+      }
+    } else {
+      // Generate anonymous identifier from session
+      if (!req.session.anonymousId) {
+        req.session.anonymousId = `anon_${Date.now()}_${Math.random()}`;
+      }
+      anonymousId = req.session.anonymousId;
+    }
+    
+    // Check if already reacted
+    let existingReaction;
+    if (userId) {
+      existingReaction = await pool.query(
+        'SELECT id FROM redflagged_reactions WHERE post_id = $1 AND user_id = $2 AND reaction_type = $3',
+        [id, userId, reaction_type]
+      );
+    } else {
+      existingReaction = await pool.query(
+        'SELECT id FROM redflagged_reactions WHERE post_id = $1 AND anonymous_identifier = $2 AND reaction_type = $3',
+        [id, anonymousId, reaction_type]
+      );
+    }
+    
+    if (existingReaction.rows.length > 0) {
+      // Remove reaction (toggle off)
+      await pool.query(
+        'DELETE FROM redflagged_reactions WHERE id = $1',
+        [existingReaction.rows[0].id]
+      );
+      
+      return res.json({ message: 'Reaction removed', action: 'removed' });
+    }
+    
+    // Add reaction
+    await pool.query(
+      'INSERT INTO redflagged_reactions (post_id, user_id, anonymous_identifier, reaction_type) VALUES ($1, $2, $3, $4)',
+      [id, userId, anonymousId, reaction_type]
+    );
+    
+    res.json({ message: 'Reaction added', action: 'added' });
+  } catch (error) {
+    console.error('Add reaction error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get user's reactions for a post
+app.get('/api/redflagged/:id/my-reactions', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const authHeader = req.headers['authorization'];
+    let userId = null;
+    let anonymousId = null;
+    
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.userId;
+      } catch (err) {
+        anonymousId = req.session.anonymousId;
+      }
+    } else {
+      anonymousId = req.session.anonymousId;
+    }
+    
+    let result;
+    if (userId) {
+      result = await pool.query(
+        'SELECT reaction_type FROM redflagged_reactions WHERE post_id = $1 AND user_id = $2',
+        [id, userId]
+      );
+    } else if (anonymousId) {
+      result = await pool.query(
+        'SELECT reaction_type FROM redflagged_reactions WHERE post_id = $1 AND anonymous_identifier = $2',
+        [id, anonymousId]
+      );
+    } else {
+      return res.json({ reactions: [] });
+    }
+    
+    res.json({ reactions: result.rows.map(r => r.reaction_type) });
+  } catch (error) {
+    console.error('Get my reactions error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Add comment/response to RedFlagged post
+app.post('/api/redflagged/:id/comments', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { commenter_name, comment, is_company_response = false } = req.body;
+    
+    if (!commenter_name?.trim()) {
+      return res.status(400).json({ error: 'Name is required' });
+    }
+    
+    if (!comment?.trim()) {
+      return res.status(400).json({ error: 'Comment is required' });
+    }
+    
+    if (comment.trim().length < 20) {
+      return res.status(400).json({ error: 'Comment must be at least 20 characters' });
+    }
+    
+    // Check if post exists
+    const postCheck = await pool.query(
+      'SELECT id FROM redflagged_posts WHERE id = $1 AND published = true',
+      [id]
+    );
+    
+    if (postCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    // Check if user is authenticated
+    const authHeader = req.headers['authorization'];
+    let userId = null;
+    
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.userId;
+      } catch (err) {
+        // Token invalid
+      }
+    }
+    
+    // Create comment
+    const result = await pool.query(
+      `INSERT INTO redflagged_comments (post_id, user_id, commenter_name, comment, is_company_response)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [id, userId, commenter_name.trim(), comment.trim(), is_company_response]
+    );
+    
+    res.status(201).json({
+      message: 'Comment added successfully',
+      comment: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Add comment error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get related posts by company name
+app.get('/api/redflagged/:id/related', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { limit = 5 } = req.query;
+    
+    // Get current post's company name
+    const postResult = await pool.query(
+      'SELECT company_name FROM redflagged_posts WHERE id = $1',
+      [id]
+    );
+    
+    if (postResult.rows.length === 0) {
+      return res.json({ posts: [] });
+    }
+    
+    const companyName = postResult.rows[0].company_name;
+    
+    // Get related posts from same company
+    const result = await pool.query(`
+      SELECT 
+        rf.*,
+        COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
+        COALESCE(u.tier, 'Guest') as author_tier,
+        (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count
+      FROM redflagged_posts rf
+      LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
+      WHERE rf.company_name = $1 AND rf.id != $2 AND rf.published = true AND rf.flagged = false
+      ORDER BY rf.views DESC, rf.created_at DESC
+      LIMIT $3
+    `, [companyName, id, parseInt(limit)]);
+    
+    res.json({ posts: result.rows });
+  } catch (error) {
+    console.error('Get related posts error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get trending companies (most posts)
+app.get('/api/redflagged/trending/companies', async (req, res) => {
+  try {
+    const { limit = 10 } = req.query;
+    
+    const result = await pool.query(`
+      SELECT 
+        company_name,
+        COUNT(*) as post_count,
+        AVG(overall_rating) as avg_rating,
+        SUM(views) as total_views
+      FROM redflagged_posts
+      WHERE published = true AND flagged = false
+      GROUP BY company_name
+      ORDER BY post_count DESC, total_views DESC
+      LIMIT $1
+    `, [parseInt(limit)]);
+    
+    res.json({ companies: result.rows });
+  } catch (error) {
+    console.error('Get trending companies error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: Flag a RedFlagged post
+app.put('/api/admin/redflagged/:id/flag', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { flagged, flagged_reason } = req.body;
+    
+    await pool.query(
+      'UPDATE redflagged_posts SET flagged = $1, flagged_reason = $2 WHERE id = $3',
+      [flagged, flagged_reason, id]
+    );
+    
+    await logAdminAction(
+      req.user.userId,
+      flagged ? 'flag' : 'unflag',
+      'redflagged_post',
+      parseInt(id),
+      flagged_reason
+    );
+    
+    res.json({ message: 'Post updated successfully' });
+  } catch (error) {
+    console.error('Flag post error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: Delete RedFlagged post
+app.delete('/api/admin/redflagged/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    await pool.query('DELETE FROM redflagged_posts WHERE id = $1', [id]);
+    
+    await logAdminAction(
+      req.user.userId,
+      'delete',
+      'redflagged_post',
+      parseInt(id),
+      'Deleted RedFlagged post'
+    );
+    
+    res.json({ message: 'Post deleted successfully' });
+  } catch (error) {
+    console.error('Delete post error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Add this catch-all route at the very end, before the error handling middleware
