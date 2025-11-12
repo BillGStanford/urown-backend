@@ -4756,6 +4756,454 @@ app.delete('/api/admin/redflagged/:id', authenticateAdmin, async (req, res) => {
   }
 });
 
+// Add these routes to your server.js file (around line 2500, after other RedFlagged routes)
+
+// ============================================
+// REDFLAGGED TOPICS ROUTES
+// ============================================
+
+// Get active topics (public route)
+app.get('/api/redflagged/topics/active', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT * FROM redflagged_topics
+      WHERE active = true
+      AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+      ORDER BY created_at DESC
+      LIMIT 10
+    `);
+    
+    res.json({ topics: result.rows });
+  } catch (error) {
+    console.error('Get active topics error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get all topics (admin/editorial only)
+app.get('/api/admin/redflagged/topics', authenticateEditorialBoard, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT rt.*, u.display_name as creator_name,
+             (SELECT COUNT(*) FROM redflagged_posts WHERE topic_id = rt.id) as post_count
+      FROM redflagged_topics rt
+      LEFT JOIN users u ON rt.created_by = u.id
+      ORDER BY rt.created_at DESC
+    `);
+    
+    res.json({ topics: result.rows });
+  } catch (error) {
+    console.error('Get all topics error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create topic (admin/editorial only)
+app.post('/api/admin/redflagged/topics', authenticateEditorialBoard, async (req, res) => {
+  try {
+    const { title, description, expires_at } = req.body;
+    const userId = req.user.userId;
+    
+    // Validate input
+    if (!title?.trim()) {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+    
+    if (!description?.trim()) {
+      return res.status(400).json({ error: 'Description is required' });
+    }
+    
+    // Check if there are already 10 active topics
+    const activeCountResult = await pool.query(
+      'SELECT COUNT(*) as count FROM redflagged_topics WHERE active = true'
+    );
+    
+    const activeCount = parseInt(activeCountResult.rows[0].count);
+    if (activeCount >= 10) {
+      return res.status(400).json({ 
+        error: 'Maximum of 10 active topics reached. Please deactivate or delete an existing topic.' 
+      });
+    }
+    
+    // Create topic
+    const result = await pool.query(
+      `INSERT INTO redflagged_topics (title, description, created_by, expires_at)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [title.trim(), description.trim(), userId, expires_at || null]
+    );
+    
+    // Log action
+    await logAdminAction(
+      userId,
+      'create',
+      'redflagged_topic',
+      result.rows[0].id,
+      `Created topic: ${title}`
+    );
+    
+    res.status(201).json({
+      message: 'Topic created successfully',
+      topic: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Create topic error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update topic (admin/editorial only)
+app.put('/api/admin/redflagged/topics/:id', authenticateEditorialBoard, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, description, expires_at } = req.body;
+    
+    // Validate input
+    if (!title?.trim()) {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+    
+    if (!description?.trim()) {
+      return res.status(400).json({ error: 'Description is required' });
+    }
+    
+    // Check if topic exists
+    const topicCheck = await pool.query(
+      'SELECT * FROM redflagged_topics WHERE id = $1',
+      [id]
+    );
+    
+    if (topicCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Topic not found' });
+    }
+    
+    // Update topic
+    const result = await pool.query(
+      `UPDATE redflagged_topics 
+       SET title = $1, description = $2, expires_at = $3
+       WHERE id = $4
+       RETURNING *`,
+      [title.trim(), description.trim(), expires_at || null, id]
+    );
+    
+    // Log action
+    await logAdminAction(
+      req.user.userId,
+      'update',
+      'redflagged_topic',
+      parseInt(id),
+      `Updated topic: ${title}`
+    );
+    
+    res.json({
+      message: 'Topic updated successfully',
+      topic: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Update topic error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Toggle topic active status (admin/editorial only)
+app.put('/api/admin/redflagged/topics/:id/toggle', authenticateEditorialBoard, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { active } = req.body;
+    
+    // If activating, check if we're at the limit
+    if (active) {
+      const activeCountResult = await pool.query(
+        'SELECT COUNT(*) as count FROM redflagged_topics WHERE active = true AND id != $1',
+        [id]
+      );
+      
+      const activeCount = parseInt(activeCountResult.rows[0].count);
+      if (activeCount >= 10) {
+        return res.status(400).json({ 
+          error: 'Maximum of 10 active topics reached. Please deactivate another topic first.' 
+        });
+      }
+    }
+    
+    // Update active status
+    await pool.query(
+      'UPDATE redflagged_topics SET active = $1 WHERE id = $2',
+      [active, id]
+    );
+    
+    // Log action
+    await logAdminAction(
+      req.user.userId,
+      active ? 'activate' : 'deactivate',
+      'redflagged_topic',
+      parseInt(id),
+      `${active ? 'Activated' : 'Deactivated'} topic`
+    );
+    
+    res.json({ message: 'Topic status updated successfully' });
+  } catch (error) {
+    console.error('Toggle topic error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete topic (admin/editorial only)
+app.delete('/api/admin/redflagged/topics/:id', authenticateEditorialBoard, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Check if topic exists
+    const topicCheck = await pool.query(
+      'SELECT * FROM redflagged_topics WHERE id = $1',
+      [id]
+    );
+    
+    if (topicCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Topic not found' });
+    }
+    
+    const topic = topicCheck.rows[0];
+    
+    // Check if there are posts using this topic
+    const postCountResult = await pool.query(
+      'SELECT COUNT(*) as count FROM redflagged_posts WHERE topic_id = $1',
+      [id]
+    );
+    
+    const postCount = parseInt(postCountResult.rows[0].count);
+    
+    if (postCount > 0) {
+      // Set topic_id to NULL for all posts using this topic
+      await pool.query(
+        'UPDATE redflagged_posts SET topic_id = NULL WHERE topic_id = $1',
+        [id]
+      );
+    }
+    
+    // Delete topic
+    await pool.query('DELETE FROM redflagged_topics WHERE id = $1', [id]);
+    
+    // Log action
+    await logAdminAction(
+      req.user.userId,
+      'delete',
+      'redflagged_topic',
+      parseInt(id),
+      `Deleted topic: ${topic.title} (${postCount} posts affected)`
+    );
+    
+    res.json({ message: 'Topic deleted successfully' });
+  } catch (error) {
+    console.error('Delete topic error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update the existing GET /api/redflagged route to include topic info
+// Find the existing route (around line 2400) and replace the query with:
+
+app.get('/api/redflagged', async (req, res) => {
+  try {
+    const { 
+      company, 
+      experienceType,
+      topicId,
+      minRating, 
+      maxRating,
+      sort = 'recent', 
+      limit = 20, 
+      offset = 0 
+    } = req.query;
+    
+    let query = `
+      SELECT 
+        rf.*,
+        COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
+        COALESCE(u.tier, 'Guest') as author_tier,
+        rt.title as topic_title,
+        rt.description as topic_description,
+        (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
+        (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
+      FROM redflagged_posts rf
+      LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
+      LEFT JOIN redflagged_topics rt ON rf.topic_id = rt.id
+      WHERE rf.published = true AND rf.flagged = false
+    `;
+    
+    const params = [];
+    let paramIndex = 1;
+    
+    if (company) {
+      query += ` AND LOWER(rf.company_name) LIKE LOWER($${paramIndex})`;
+      params.push(`%${company}%`);
+      paramIndex++;
+    }
+    
+    if (experienceType) {
+      query += ` AND rf.experience_type = $${paramIndex}`;
+      params.push(experienceType);
+      paramIndex++;
+    }
+    
+    if (topicId) {
+      query += ` AND rf.topic_id = $${paramIndex}`;
+      params.push(parseInt(topicId));
+      paramIndex++;
+    }
+    
+    if (minRating) {
+      query += ` AND rf.overall_rating >= $${paramIndex}`;
+      params.push(parseFloat(minRating));
+      paramIndex++;
+    }
+    
+    if (maxRating) {
+      query += ` AND rf.overall_rating <= $${paramIndex}`;
+      params.push(parseFloat(maxRating));
+      paramIndex++;
+    }
+    
+    // Sort options
+    switch (sort) {
+      case 'popular':
+        query += ' ORDER BY rf.views DESC, rf.reaction_count DESC';
+        break;
+      case 'controversial':
+        query += ' ORDER BY rf.reaction_count DESC, rf.views DESC';
+        break;
+      case 'highest-rated':
+        query += ' ORDER BY rf.overall_rating DESC, rf.views DESC';
+        break;
+      case 'lowest-rated':
+        query += ' ORDER BY rf.overall_rating ASC, rf.views DESC';
+        break;
+      default: // recent
+        query += ' ORDER BY rf.created_at DESC';
+    }
+    
+    query += ` LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    
+    // Get total count for pagination
+    let countQuery = `
+      SELECT COUNT(*) as total
+      FROM redflagged_posts rf
+      WHERE rf.published = true AND rf.flagged = false
+    `;
+    
+    const countParams = [];
+    let countIndex = 1;
+    
+    if (company) {
+      countQuery += ` AND LOWER(rf.company_name) LIKE LOWER($${countIndex})`;
+      countParams.push(`%${company}%`);
+      countIndex++;
+    }
+    
+    if (experienceType) {
+      countQuery += ` AND rf.experience_type = $${countIndex}`;
+      countParams.push(experienceType);
+      countIndex++;
+    }
+    
+    if (topicId) {
+      countQuery += ` AND rf.topic_id = $${countIndex}`;
+      countParams.push(parseInt(topicId));
+      countIndex++;
+    }
+    
+    if (minRating) {
+      countQuery += ` AND rf.overall_rating >= $${countIndex}`;
+      countParams.push(parseFloat(minRating));
+      countIndex++;
+    }
+    
+    if (maxRating) {
+      countQuery += ` AND rf.overall_rating <= $${countIndex}`;
+      countParams.push(parseFloat(maxRating));
+    }
+    
+    const countResult = await pool.query(countQuery, countParams);
+    
+    res.json({ 
+      posts: result.rows,
+      total: parseInt(countResult.rows[0].total)
+    });
+  } catch (error) {
+    console.error('Get RedFlagged posts error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Also update the single post GET route to include topic info
+// Find the existing GET /api/redflagged/:id route and update the query to:
+
+app.get('/api/redflagged/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const postResult = await pool.query(`
+      SELECT 
+        rf.*,
+        COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
+        COALESCE(u.tier, 'Guest') as author_tier,
+        rt.title as topic_title,
+        rt.description as topic_description,
+        (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
+        (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
+      FROM redflagged_posts rf
+      LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
+      LEFT JOIN redflagged_topics rt ON rf.topic_id = rt.id
+      WHERE rf.id = $1 AND rf.published = true
+    `, [id]);
+    
+    if (postResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    let post = postResult.rows[0];
+    
+    // Increment view count (session-based to prevent spam)
+    const sessionKey = `redflagged_view_${id}`;
+    const hasViewed = req.session[sessionKey];
+    
+    if (!hasViewed) {
+      await pool.query('UPDATE redflagged_posts SET views = views + 1 WHERE id = $1', [id]);
+      req.session[sessionKey] = true;
+      const updatedViewResult = await pool.query('SELECT views FROM redflagged_posts WHERE id = $1', [id]);
+      post.views = updatedViewResult.rows[0].views;
+    }
+    
+    // Get reactions breakdown
+    const reactionsResult = await pool.query(`
+      SELECT reaction_type, COUNT(*) as count
+      FROM redflagged_reactions
+      WHERE post_id = $1
+      GROUP BY reaction_type
+    `, [id]);
+    
+    // Get comments
+    const commentsResult = await pool.query(`
+      SELECT *
+      FROM redflagged_comments
+      WHERE post_id = $1
+      ORDER BY created_at DESC
+    `, [id]);
+    
+    res.json({ 
+      post,
+      reactions: reactionsResult.rows,
+      comments: commentsResult.rows
+    });
+  } catch (error) {
+    console.error('Get RedFlagged post error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Add this catch-all route at the very end, before the error handling middleware
 // This serves the React app for any route that doesn't match API routes
 app.get('*', (req, res) => {
