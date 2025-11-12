@@ -4164,16 +4164,39 @@ app.get('/api/redflagged', async (req, res) => {
     } = req.query;
     
     let query = `
-      SELECT 
-        rf.*,
-        COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
-        COALESCE(u.tier, 'Guest') as author_tier,
-        (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
-        (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
-      FROM redflagged_posts rf
-      LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
-      WHERE rf.published = true AND rf.flagged = false
-    `;
+  SELECT 
+    rf.id,
+    rf.user_id,
+    rf.company_name,
+    rf.position,
+    rf.experience_type,
+    rf.story,
+    rf.rating_fairness,
+    rf.rating_pay,
+    rf.rating_culture,
+    rf.rating_management,
+    (rf.rating_fairness + rf.rating_pay + rf.rating_culture + rf.rating_management)::DECIMAL / 4.0 as overall_rating,
+    rf.anonymous_username,
+    rf.is_anonymous,
+    rf.published,
+    rf.flagged,
+    rf.flagged_reason,
+    rf.views,
+    rf.reaction_count,
+    rf.created_at,
+    rf.updated_at,
+    rf.topic_id,
+    COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
+    COALESCE(u.tier, 'Guest') as author_tier,
+    rt.title as topic_title,
+    rt.description as topic_description,
+    (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
+    (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
+  FROM redflagged_posts rf
+  LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
+  LEFT JOIN redflagged_topics rt ON rf.topic_id = rt.id
+  WHERE rf.published = true AND rf.flagged = false
+`;
     
     const params = [];
     let paramIndex = 1;
