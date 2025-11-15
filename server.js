@@ -266,6 +266,108 @@ const initDatabase = async () => {
       console.log('Ideology columns may already exist:', error.message);
     }
 
+    // Add UROWN Score columns to users table
+    await pool.query(`
+      ALTER TABLE users 
+      ADD COLUMN IF NOT EXISTS urown_score INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_score_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    `);
+
+    // Create index for faster leaderboard queries
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_urown_score ON users(urown_score DESC)
+    `);
+
+    // Create score_activities table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS score_activities (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        activity_type VARCHAR(50) NOT NULL,
+        points_earned INTEGER NOT NULL,
+        reference_id INTEGER,
+        reference_type VARCHAR(50),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_score_activities_user_id ON score_activities(user_id);
+      CREATE INDEX IF NOT EXISTS idx_score_activities_created_at ON score_activities(created_at DESC);
+    `);
+
+    // Create leaderboard_history table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS leaderboard_history (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        display_name VARCHAR(100) NOT NULL,
+        entered_top_15 BOOLEAN DEFAULT TRUE,
+        rank_position INTEGER NOT NULL,
+        urown_score INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_leaderboard_history_created_at ON leaderboard_history(created_at DESC)
+    `);
+
+    // Create score update function
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION update_user_score(
+        p_user_id INTEGER,
+        p_activity_type VARCHAR(50),
+        p_points INTEGER,
+        p_reference_id INTEGER DEFAULT NULL,
+        p_reference_type VARCHAR(50) DEFAULT NULL
+      ) RETURNS INTEGER AS $$       DECLARE
+        v_new_score INTEGER;
+        v_old_rank INTEGER;
+        v_new_rank INTEGER;
+        v_display_name VARCHAR(100);
+      BEGIN
+        SELECT urown_score, display_name INTO v_new_score, v_display_name
+        FROM users WHERE id = p_user_id;
+        
+        v_new_score := COALESCE(v_new_score, 0) + p_points;
+        
+        SELECT rank_num INTO v_old_rank
+        FROM (
+          SELECT id, ROW_NUMBER() OVER (ORDER BY urown_score DESC, created_at ASC) as rank_num
+          FROM users
+          WHERE account_status = 'active' AND urown_score > 0
+        ) ranked
+        WHERE id = p_user_id AND rank_num <= 15;
+        
+        UPDATE users 
+        SET urown_score = v_new_score,
+            last_score_update = CURRENT_TIMESTAMP
+        WHERE id = p_user_id;
+        
+        INSERT INTO score_activities (user_id, activity_type, points_earned, reference_id, reference_type)
+        VALUES (p_user_id, p_activity_type, p_points, p_reference_id, p_reference_type);
+        
+        SELECT rank_num INTO v_new_rank
+        FROM (
+          SELECT id, ROW_NUMBER() OVER (ORDER BY urown_score DESC, created_at ASC) as rank_num
+          FROM users
+          WHERE account_status = 'active' AND urown_score > 0
+        ) ranked
+        WHERE id = p_user_id AND rank_num <= 15;
+        
+        IF v_old_rank IS NULL AND v_new_rank IS NOT NULL THEN
+          INSERT INTO leaderboard_history (user_id, display_name, entered_top_15, rank_position, urown_score)
+          VALUES (p_user_id, v_display_name, TRUE, v_new_rank, v_new_score);
+        END IF;
+        
+        RETURN v_new_score;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    console.log('UROWN Score system initialized successfully');
+
     // Create followers table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS followers (
@@ -666,6 +768,18 @@ const initDatabase = async () => {
   } catch (error) {
     console.error('Error initializing database:', error);
     throw error;
+  }
+};
+
+// Helper function to award points
+const awardPoints = async (userId, activityType, points, referenceId = null, referenceType = null) => {
+  try {
+    await pool.query(
+      'SELECT update_user_score($1, $2, $3, $4, $5)',
+      [userId, activityType, points, referenceId, referenceType]
+    );
+  } catch (error) {
+    console.error('Error awarding points:', error);
   }
 };
 
@@ -1816,7 +1930,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
       `SELECT id, email, phone, full_name, display_name, discord_username, tier, role, 
               weekly_articles_count, weekly_reset_date, 
               display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
-              discord_username_updated_at, created_at, followers,
+              discord_username_updated_at, created_at, followers, urown_score,
               ideology, ideology_details, ideology_public, ideology_updated_at
        FROM users 
        WHERE id = $1`,
@@ -2275,9 +2389,18 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
       );
     }
 
+    // Award points for article creation
+    if (published && !parent_article_id && !debate_topic_id) {
+      await awardPoints(userId, 'article_published', 10, article.id, 'article');
+    } else if (published && parent_article_id) {
+      await awardPoints(userId, 'counter_argument', 12, article.id, 'article');
+    } else if (published && debate_topic_id) {
+      await awardPoints(userId, 'debate_opinion', 10, article.id, 'article');
+    }
+
     // Get updated user data to return to client
     const updatedUserResult = await pool.query(
-      'SELECT id, email, phone, full_name, display_name, discord_username, tier, role, weekly_articles_count, weekly_reset_date, display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, discord_username_updated_at, created_at FROM users WHERE id = $1',
+      'SELECT id, email, phone, full_name, display_name, discord_username, tier, role, weekly_articles_count, weekly_reset_date, display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, discord_username_updated_at, created_at, urown_score FROM users WHERE id = $1',
       [userId]
     );
 
@@ -2583,6 +2706,9 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
         'UPDATE users SET weekly_articles_count = weekly_articles_count + 1 WHERE id = $1',
         [userId]
       );
+      
+      // Award points for publishing
+      await awardPoints(userId, 'article_published', 10, parseInt(id), 'article');
     }
 
     res.json({
@@ -2693,6 +2819,11 @@ app.post('/api/editorial/articles/:id/certify', authenticateEditorialBoard, asyn
       );
     }
     
+    // Award points for certification (only when certifying, not uncertifying)
+    if (certified && article.user_id) {
+      await awardPoints(article.user_id, 'article_certified', 20, parseInt(id), 'article');
+    }
+    
     // Log the action
     await logAdminAction(
       req.user.userId,
@@ -2719,7 +2850,7 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.discord_username, u.tier, u.role, 
-              u.weekly_articles_count, u.created_at, u.updated_at,
+              u.weekly_articles_count, u.created_at, u.updated_at, u.urown_score,
               ub.ban_end, ub.reason as ban_reason
        FROM users u
        LEFT JOIN user_bans ub ON u.id = ub.user_id AND ub.ban_end > CURRENT_TIMESTAMP
@@ -2741,7 +2872,7 @@ app.get('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
     
     const result = await pool.query(
       `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.discord_username, u.tier, u.role, 
-              u.weekly_articles_count, u.created_at, u.updated_at,
+              u.weekly_articles_count, u.created_at, u.updated_at, u.urown_score,
               ub.ban_end, ub.reason as ban_reason
        FROM users u
        LEFT JOIN user_bans ub ON u.id = ub.user_id AND ub.ban_end > CURRENT_TIMESTAMP
@@ -3216,6 +3347,11 @@ app.post('/api/debate-topics/:id/opinions', async (req, res) => {
       [userId, title.trim(), content.trim(), id, !isAuthenticated ? anonymousUsername.trim() : null]
     );
     
+    // Award points for debate opinion
+    if (isAuthenticated) {
+      await awardPoints(userId, 'debate_opinion', 10, result.rows[0].id, 'article');
+    }
+    
     res.status(201).json({
       message: 'Opinion created successfully',
       article: result.rows[0]
@@ -3390,7 +3526,7 @@ app.get('/api/users/:display_name', async (req, res) => {
     
     // Get user info - include discord_username
     const userResult = await pool.query(
-      `SELECT id, display_name, discord_username, tier, role, created_at, followers,
+      `SELECT id, display_name, discord_username, tier, role, created_at, followers, urown_score,
               ideology, ideology_details, ideology_public, ideology_updated_at
        FROM users 
        WHERE display_name = $1 AND account_status = 'active'`,
@@ -3455,6 +3591,7 @@ app.get('/api/users/:display_name', async (req, res) => {
       role: user.role,
       created_at: user.created_at,
       followers: user.followers || 0,
+      urown_score: user.urown_score || 0,
       isFollowing
     };
     
@@ -3524,6 +3661,12 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
       [followerId, id]
     );
     
+    // Update followers count
+    await pool.query(
+      'UPDATE users SET followers = followers + 1 WHERE id = $1',
+      [id]
+    );
+    
     res.json({ message: 'User followed successfully' });
   } catch (error) {
     console.error('Follow user error:', error);
@@ -3561,6 +3704,12 @@ app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
     await pool.query(
       'DELETE FROM followers WHERE follower_id = $1 AND following_id = $2',
       [followerId, id]
+    );
+    
+    // Update followers count
+    await pool.query(
+      'UPDATE users SET followers = GREATEST(followers - 1, 0) WHERE id = $1',
+      [id]
     );
     
     res.json({ message: 'User unfollowed successfully' });
@@ -4155,7 +4304,8 @@ app.get('/api/redflagged', async (req, res) => {
   try {
     const { 
       company, 
-      experienceType, 
+      experienceType,
+      topicId,
       minRating, 
       maxRating,
       sort = 'recent', 
@@ -4164,39 +4314,19 @@ app.get('/api/redflagged', async (req, res) => {
     } = req.query;
     
     let query = `
-  SELECT 
-    rf.id,
-    rf.user_id,
-    rf.company_name,
-    rf.position,
-    rf.experience_type,
-    rf.story,
-    rf.rating_fairness,
-    rf.rating_pay,
-    rf.rating_culture,
-    rf.rating_management,
-    (rf.rating_fairness + rf.rating_pay + rf.rating_culture + rf.rating_management)::DECIMAL / 4.0 as overall_rating,
-    rf.anonymous_username,
-    rf.is_anonymous,
-    rf.published,
-    rf.flagged,
-    rf.flagged_reason,
-    rf.views,
-    rf.reaction_count,
-    rf.created_at,
-    rf.updated_at,
-    rf.topic_id,
-    COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
-    COALESCE(u.tier, 'Guest') as author_tier,
-    rt.title as topic_title,
-    rt.description as topic_description,
-    (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
-    (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
-  FROM redflagged_posts rf
-  LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
-  LEFT JOIN redflagged_topics rt ON rf.topic_id = rt.id
-  WHERE rf.published = true AND rf.flagged = false
-`;
+      SELECT 
+        rf.*,
+        COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
+        COALESCE(u.tier, 'Guest') as author_tier,
+        rt.title as topic_title,
+        rt.description as topic_description,
+        (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
+        (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
+      FROM redflagged_posts rf
+      LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
+      LEFT JOIN redflagged_topics rt ON rf.topic_id = rt.id
+      WHERE rf.published = true AND rf.flagged = false
+    `;
     
     const params = [];
     let paramIndex = 1;
@@ -4210,6 +4340,12 @@ app.get('/api/redflagged', async (req, res) => {
     if (experienceType) {
       query += ` AND rf.experience_type = $${paramIndex}`;
       params.push(experienceType);
+      paramIndex++;
+    }
+    
+    if (topicId) {
+      query += ` AND rf.topic_id = $${paramIndex}`;
+      params.push(parseInt(topicId));
       paramIndex++;
     }
     
@@ -4270,6 +4406,12 @@ app.get('/api/redflagged', async (req, res) => {
       countIndex++;
     }
     
+    if (topicId) {
+      countQuery += ` AND rf.topic_id = $${countIndex}`;
+      countParams.push(parseInt(topicId));
+      countIndex++;
+    }
+    
     if (minRating) {
       countQuery += ` AND rf.overall_rating >= $${countIndex}`;
       countParams.push(parseFloat(minRating));
@@ -4303,10 +4445,13 @@ app.get('/api/redflagged/:id', async (req, res) => {
         rf.*,
         COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
         COALESCE(u.tier, 'Guest') as author_tier,
+        rt.title as topic_title,
+        rt.description as topic_description,
         (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
         (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
       FROM redflagged_posts rf
       LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
+      LEFT JOIN redflagged_topics rt ON rf.topic_id = rt.id
       WHERE rf.id = $1 AND rf.published = true
     `, [id]);
     
@@ -4450,7 +4595,7 @@ app.post('/api/redflagged', async (req, res) => {
       });
     }
     
-    // Create the post
+    // Create to post
     const result = await pool.query(
       `INSERT INTO redflagged_posts (
         user_id, company_name, position, experience_type, story,
@@ -4473,6 +4618,11 @@ app.post('/api/redflagged', async (req, res) => {
         is_anonymous || !isAuthenticated
       ]
     );
+    
+    // Award points for RedFlagged post creation
+    if (isAuthenticated) {
+      await awardPoints(userId, 'redflagged_post', 8, result.rows[0].id, 'redflagged_post');
+    }
     
     res.status(201).json({
       message: 'Post created successfully',
@@ -4556,6 +4706,11 @@ app.post('/api/redflagged/:id/react', async (req, res) => {
       'INSERT INTO redflagged_reactions (post_id, user_id, anonymous_identifier, reaction_type) VALUES ($1, $2, $3, $4)',
       [id, userId, anonymousId, reaction_type]
     );
+    
+    // Award points for reaction (only for authenticated users and only when adding, not removing)
+    if (userId) {
+      await awardPoints(userId, 'redflagged_reaction', 1, parseInt(id), 'redflagged_reaction');
+    }
     
     res.json({ message: 'Reaction added', action: 'added' });
   } catch (error) {
@@ -4656,6 +4811,11 @@ app.post('/api/redflagged/:id/comments', async (req, res) => {
        RETURNING *`,
       [id, userId, commenter_name.trim(), comment.trim(), is_company_response]
     );
+    
+    // Award points for comment (only for authenticated users)
+    if (userId) {
+      await awardPoints(userId, 'redflagged_comment', 2, result.rows[0].id, 'redflagged_comment');
+    }
     
     res.status(201).json({
       message: 'Comment added successfully',
@@ -4778,8 +4938,6 @@ app.delete('/api/admin/redflagged/:id', authenticateAdmin, async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
-
-// Add these routes to your server.js file (around line 2500, after other RedFlagged routes)
 
 // ============================================
 // REDFLAGGED TOPICS ROUTES
@@ -5023,211 +5181,185 @@ app.delete('/api/admin/redflagged/topics/:id', authenticateEditorialBoard, async
   }
 });
 
-// Update the existing GET /api/redflagged route to include topic info
-// Find the existing route (around line 2400) and replace the query with:
+// ============================================
+// LEADERBOARD ROUTES
+// ============================================
 
-app.get('/api/redflagged', async (req, res) => {
+// Get leaderboard (public route)
+app.get('/api/leaderboard', async (req, res) => {
   try {
-    const { 
-      company, 
-      experienceType,
-      topicId,
-      minRating, 
-      maxRating,
-      sort = 'recent', 
-      limit = 20, 
-      offset = 0 
-    } = req.query;
-    
-    let query = `
+    const result = await pool.query(`
       SELECT 
-        rf.*,
-        COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
-        COALESCE(u.tier, 'Guest') as author_tier,
-        rt.title as topic_title,
-        rt.description as topic_description,
-        (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
-        (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
-      FROM redflagged_posts rf
-      LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
-      LEFT JOIN redflagged_topics rt ON rf.topic_id = rt.id
-      WHERE rf.published = true AND rf.flagged = false
-    `;
+        u.id,
+        u.display_name,
+        u.urown_score,
+        u.tier,
+        u.created_at,
+        u.last_score_update,
+        ROW_NUMBER() OVER (ORDER BY u.urown_score DESC, u.created_at ASC) as rank
+      FROM users u
+      WHERE u.account_status = 'active' AND u.urown_score > 0
+      ORDER BY u.urown_score DESC, u.created_at ASC
+      LIMIT 15
+    `);
     
-    const params = [];
-    let paramIndex = 1;
-    
-    if (company) {
-      query += ` AND LOWER(rf.company_name) LIKE LOWER($${paramIndex})`;
-      params.push(`%${company}%`);
-      paramIndex++;
-    }
-    
-    if (experienceType) {
-      query += ` AND rf.experience_type = $${paramIndex}`;
-      params.push(experienceType);
-      paramIndex++;
-    }
-    
-    if (topicId) {
-      query += ` AND rf.topic_id = $${paramIndex}`;
-      params.push(parseInt(topicId));
-      paramIndex++;
-    }
-    
-    if (minRating) {
-      query += ` AND rf.overall_rating >= $${paramIndex}`;
-      params.push(parseFloat(minRating));
-      paramIndex++;
-    }
-    
-    if (maxRating) {
-      query += ` AND rf.overall_rating <= $${paramIndex}`;
-      params.push(parseFloat(maxRating));
-      paramIndex++;
-    }
-    
-    // Sort options
-    switch (sort) {
-      case 'popular':
-        query += ' ORDER BY rf.views DESC, rf.reaction_count DESC';
-        break;
-      case 'controversial':
-        query += ' ORDER BY rf.reaction_count DESC, rf.views DESC';
-        break;
-      case 'highest-rated':
-        query += ' ORDER BY rf.overall_rating DESC, rf.views DESC';
-        break;
-      case 'lowest-rated':
-        query += ' ORDER BY rf.overall_rating ASC, rf.views DESC';
-        break;
-      default: // recent
-        query += ' ORDER BY rf.created_at DESC';
-    }
-    
-    query += ` LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
-    params.push(parseInt(limit), parseInt(offset));
-    
-    const result = await pool.query(query, params);
-    
-    // Get total count for pagination
-    let countQuery = `
-      SELECT COUNT(*) as total
-      FROM redflagged_posts rf
-      WHERE rf.published = true AND rf.flagged = false
-    `;
-    
-    const countParams = [];
-    let countIndex = 1;
-    
-    if (company) {
-      countQuery += ` AND LOWER(rf.company_name) LIKE LOWER($${countIndex})`;
-      countParams.push(`%${company}%`);
-      countIndex++;
-    }
-    
-    if (experienceType) {
-      countQuery += ` AND rf.experience_type = $${countIndex}`;
-      countParams.push(experienceType);
-      countIndex++;
-    }
-    
-    if (topicId) {
-      countQuery += ` AND rf.topic_id = $${countIndex}`;
-      countParams.push(parseInt(topicId));
-      countIndex++;
-    }
-    
-    if (minRating) {
-      countQuery += ` AND rf.overall_rating >= $${countIndex}`;
-      countParams.push(parseFloat(minRating));
-      countIndex++;
-    }
-    
-    if (maxRating) {
-      countQuery += ` AND rf.overall_rating <= $${countIndex}`;
-      countParams.push(parseFloat(maxRating));
-    }
-    
-    const countResult = await pool.query(countQuery, countParams);
-    
-    res.json({ 
-      posts: result.rows,
-      total: parseInt(countResult.rows[0].total)
-    });
+    res.json({ leaderboard: result.rows });
   } catch (error) {
-    console.error('Get RedFlagged posts error:', error);
+    console.error('Get leaderboard error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Also update the single post GET route to include topic info
-// Find the existing GET /api/redflagged/:id route and update the query to:
-
-app.get('/api/redflagged/:id', async (req, res) => {
+// Get leaderboard announcements
+app.get('/api/leaderboard/announcements', async (req, res) => {
   try {
-    const { id } = req.params;
-    
-    const postResult = await pool.query(`
+    const result = await pool.query(`
       SELECT 
-        rf.*,
-        COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
-        COALESCE(u.tier, 'Guest') as author_tier,
-        rt.title as topic_title,
-        rt.description as topic_description,
-        (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
-        (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
-      FROM redflagged_posts rf
-      LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
-      LEFT JOIN redflagged_topics rt ON rf.topic_id = rt.id
-      WHERE rf.id = $1 AND rf.published = true
-    `, [id]);
+        lh.display_name,
+        lh.rank_position,
+        lh.urown_score,
+        lh.created_at
+      FROM leaderboard_history lh
+      WHERE lh.entered_top_15 = TRUE
+      ORDER BY lh.created_at DESC
+      LIMIT 10
+    `);
     
-    if (postResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Post not found' });
-    }
-    
-    let post = postResult.rows[0];
-    
-    // Increment view count (session-based to prevent spam)
-    const sessionKey = `redflagged_view_${id}`;
-    const hasViewed = req.session[sessionKey];
-    
-    if (!hasViewed) {
-      await pool.query('UPDATE redflagged_posts SET views = views + 1 WHERE id = $1', [id]);
-      req.session[sessionKey] = true;
-      const updatedViewResult = await pool.query('SELECT views FROM redflagged_posts WHERE id = $1', [id]);
-      post.views = updatedViewResult.rows[0].views;
-    }
-    
-    // Get reactions breakdown
-    const reactionsResult = await pool.query(`
-      SELECT reaction_type, COUNT(*) as count
-      FROM redflagged_reactions
-      WHERE post_id = $1
-      GROUP BY reaction_type
-    `, [id]);
-    
-    // Get comments
-    const commentsResult = await pool.query(`
-      SELECT *
-      FROM redflagged_comments
-      WHERE post_id = $1
-      ORDER BY created_at DESC
-    `, [id]);
-    
-    res.json({ 
-      post,
-      reactions: reactionsResult.rows,
-      comments: commentsResult.rows
-    });
+    res.json({ announcements: result.rows });
   } catch (error) {
-    console.error('Get RedFlagged post error:', error);
+    console.error('Get announcements error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Add this catch-all route at the very end, before the error handling middleware
+// Get user's score activity history
+app.get('/api/user/score-history', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { limit = 50, offset = 0 } = req.query;
+    
+    const result = await pool.query(`
+      SELECT 
+        sa.activity_type,
+        sa.points_earned,
+        sa.reference_id,
+        sa.reference_type,
+        sa.created_at
+      FROM score_activities sa
+      WHERE sa.user_id = $1
+      ORDER BY sa.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [userId, parseInt(limit), parseInt(offset)]);
+    
+    res.json({ activities: result.rows });
+  } catch (error) {
+    console.error('Get score history error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get user's current rank
+app.get('/api/user/rank', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const result = await pool.query(`
+      SELECT 
+        u.urown_score,
+        u.id as user_id,
+        ranked.rank,
+        ranked.total_users
+      FROM users u
+      CROSS JOIN (
+        SELECT 
+          id,
+          ROW_NUMBER() OVER (ORDER BY urown_score DESC, created_at ASC) as rank,
+          COUNT(*) OVER () as total_users
+        FROM users
+        WHERE account_status = 'active' AND urown_score > 0
+      ) ranked
+      WHERE u.id = $1 AND ranked.id = $1
+    `, [userId]);
+    
+    if (result.rows.length === 0) {
+      const totalUsers = await pool.query(
+        'SELECT COUNT(*) as total FROM users WHERE account_status = $1',
+        ['active']
+      );
+      return res.json({ 
+        score: 0, 
+        rank: null, 
+        total_users: parseInt(totalUsers.rows[0].total),
+        userId: userId
+      });
+    }
+    
+    res.json({
+      score: result.rows[0].urown_score || 0,
+      rank: result.rows[0].rank,
+      total_users: result.rows[0].total_users,
+      userId: result.rows[0].user_id
+    });
+  } catch (error) {
+    console.error('Get user rank error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
+// MILESTONE BONUS SYSTEM
+// ============================================
+
+// Auto-check for milestones every hour
+setInterval(async () => {
+  try {
+    // Award points for articles reaching 100 views
+    const viewMilestones = await pool.query(`
+      SELECT a.id, a.user_id, a.views
+      FROM articles a
+      LEFT JOIN score_activities sa ON sa.reference_id = a.id 
+        AND sa.reference_type = 'article' 
+        AND sa.activity_type = 'article_views_100'
+      WHERE a.views >= 100 
+        AND a.published = TRUE
+        AND a.user_id IS NOT NULL
+        AND sa.id IS NULL
+    `);
+    
+    for (const article of viewMilestones.rows) {
+      await awardPoints(article.user_id, 'article_views_100', 5, article.id, 'article');
+    }
+    
+    if (viewMilestones.rows.length > 0) {
+      console.log(`Awarded view milestone bonuses to ${viewMilestones.rows.length} articles`);
+    }
+
+    // Award points for newly certified articles
+    const certifications = await pool.query(`
+      SELECT ec.article_id, a.user_id
+      FROM editorial_certifications ec
+      JOIN articles a ON a.id = ec.article_id
+      LEFT JOIN score_activities sa ON sa.reference_id = ec.article_id 
+        AND sa.reference_type = 'article' 
+        AND sa.activity_type = 'article_certified'
+      WHERE ec.certified = TRUE
+        AND a.user_id IS NOT NULL
+        AND sa.id IS NULL
+    `);
+    
+    for (const cert of certifications.rows) {
+      await awardPoints(cert.user_id, 'article_certified', 20, cert.article_id, 'article');
+    }
+
+    if (certifications.rows.length > 0) {
+      console.log(`Awarded certification bonuses to ${certifications.rows.length} articles`);
+    }
+  } catch (error) {
+    console.error('Auto milestone check error:', error);
+  }
+}, 60 * 60 * 1000); // Every hour
+
+// Add this catch-all route at very end, before error handling middleware
 // This serves the React app for any route that doesn't match API routes
 app.get('*', (req, res) => {
   if (fs.existsSync(buildPath)) {
