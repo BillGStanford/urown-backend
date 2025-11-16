@@ -3691,47 +3691,62 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
 });
 
 // Unfollow a user
+// Unfollow a user
 app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  
   try {
     const { id } = req.params;
     const followerId = req.user.userId;
     
-    // Check if user exists
-    const userResult = await pool.query(
-      'SELECT id FROM users WHERE id = $1 AND account_status = $2',
+    // Start transaction
+    await client.query('BEGIN');
+    
+    // Check if user exists and get current followers count
+    const userResult = await client.query(
+      'SELECT id, followers FROM users WHERE id = $1 AND account_status = $2',
       [id, 'active']
     );
     
     if (userResult.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'User not found' });
     }
     
     // Check if following
-    const followCheck = await pool.query(
+    const followCheck = await client.query(
       'SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2',
       [followerId, id]
     );
     
     if (followCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: 'You are not following this user' });
     }
     
     // Remove follow relationship
-    await pool.query(
+    await client.query(
       'DELETE FROM followers WHERE follower_id = $1 AND following_id = $2',
       [followerId, id]
     );
     
-    // Update followers count
-    await pool.query(
-      'UPDATE users SET followers = GREATEST(followers - 1, 0) WHERE id = $1',
-      [id]
+    // Update followers count - using current value from database
+    const currentFollowers = userResult.rows[0].followers || 0;
+    await client.query(
+      'UPDATE users SET followers = GREATEST($1 - 1, 0) WHERE id = $2',
+      [currentFollowers, id]
     );
+    
+    // Commit transaction
+    await client.query('COMMIT');
     
     res.json({ message: 'User unfollowed successfully' });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Unfollow user error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
