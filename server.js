@@ -3625,52 +3625,68 @@ app.get('/api/users/:display_name', async (req, res) => {
 });
 
 // Follow a user
+// Follow a user
 app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  
   try {
     const { id } = req.params;
     const followerId = req.user.userId;
     
+    // Start transaction
+    await client.query('BEGIN');
+    
     // Check if user exists
-    const userResult = await pool.query(
-      'SELECT id FROM users WHERE id = $1 AND account_status = $2',
+    const userResult = await client.query(
+      'SELECT id, followers FROM users WHERE id = $1 AND account_status = $2',
       [id, 'active']
     );
     
     if (userResult.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'User not found' });
     }
     
     // Check if user is trying to follow themselves
     if (parseInt(id) === followerId) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: 'You cannot follow yourself' });
     }
     
     // Check if already following
-    const followCheck = await pool.query(
+    const followCheck = await client.query(
       'SELECT id FROM followers WHERE follower_id = $1 AND following_id = $2',
       [followerId, id]
     );
     
     if (followCheck.rows.length > 0) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: 'You are already following this user' });
     }
     
     // Create follow relationship
-    await pool.query(
+    await client.query(
       'INSERT INTO followers (follower_id, following_id) VALUES ($1, $2)',
       [followerId, id]
     );
     
-    // Update followers count
-    await pool.query(
-      'UPDATE users SET followers = followers + 1 WHERE id = $1',
-      [id]
+    // Update followers count - using the current value from the database
+    const currentFollowers = userResult.rows[0].followers || 0;
+    await client.query(
+      'UPDATE users SET followers = $1 WHERE id = $2',
+      [currentFollowers + 1, id]
     );
+    
+    // Commit transaction
+    await client.query('COMMIT');
     
     res.json({ message: 'User followed successfully' });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Follow user error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
