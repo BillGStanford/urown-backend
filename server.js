@@ -1681,9 +1681,15 @@ app.delete('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
 });
 
 // Signup
+// Update the signup route in server.js to include invite_code handling
+
+// Signup
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, phone, full_name, display_name, discord_username, date_of_birth, password, terms_agreed } = req.body;
+    const { 
+      email, phone, full_name, display_name, discord_username, 
+      date_of_birth, password, terms_agreed, invite_code 
+    } = req.body;
     
     // Manual validation for better error messages
     const errors = {};
@@ -1739,6 +1745,31 @@ app.post('/api/auth/signup', async (req, res) => {
       errors.terms_agreed = 'You must agree to the terms of service';
     }
     
+    // Invite code validation (optional, but if provided must be valid)
+    let validatedInviteCode = null;
+    if (invite_code && invite_code.trim()) {
+      const upperInviteCode = invite_code.trim().toUpperCase();
+      
+      // Check format
+      if (!/^[A-Z0-9]{6}$/.test(upperInviteCode)) {
+        errors.invite_code = 'Invite code must be 6 alphanumeric characters';
+      } else {
+        // Check if code exists and is active
+        const inviteCodeCheck = await pool.query(
+          'SELECT code, active FROM invite_codes WHERE code = $1',
+          [upperInviteCode]
+        );
+        
+        if (inviteCodeCheck.rows.length === 0) {
+          errors.invite_code = 'Invalid invite code';
+        } else if (!inviteCodeCheck.rows[0].active) {
+          errors.invite_code = 'This invite code is no longer active';
+        } else {
+          validatedInviteCode = upperInviteCode;
+        }
+      }
+    }
+    
     // If there are validation errors, return them
     if (Object.keys(errors).length > 0) {
       return res.status(400).json({ 
@@ -1773,12 +1804,26 @@ app.post('/api/auth/signup', async (req, res) => {
     const saltRounds = 12;
     const password_hash = await bcrypt.hash(password, saltRounds);
 
-    // Create user
+    // Create user with invite code
     const result = await pool.query(
-      `INSERT INTO users (email, phone, full_name, display_name, discord_username, date_of_birth, password_hash, terms_agreed)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, created_at`,
-      [email, phone || null, full_name || null, display_name, discord_username || null, date_of_birth, password_hash, terms_agreed]
+      `INSERT INTO users (
+        email, phone, full_name, display_name, discord_username, 
+        date_of_birth, password_hash, terms_agreed, invite_code_used
+      )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, email, phone, full_name, display_name, discord_username, 
+                 tier, role, created_at, invite_code_used`,
+      [
+        email, 
+        phone || null, 
+        full_name || null, 
+        display_name, 
+        discord_username || null, 
+        date_of_birth, 
+        password_hash, 
+        terms_agreed,
+        validatedInviteCode
+      ]
     );
 
     const user = result.rows[0];
@@ -1802,7 +1847,8 @@ app.post('/api/auth/signup', async (req, res) => {
         discord_username: user.discord_username,
         tier: user.tier,
         role: user.role,
-        created_at: user.created_at
+        created_at: user.created_at,
+        invite_code_used: user.invite_code_used
       }
     });
 
