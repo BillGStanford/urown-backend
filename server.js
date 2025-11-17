@@ -226,7 +226,6 @@ const initDatabase = async () => {
         hard_deleted_at TIMESTAMP,
         deletion_reason TEXT,
         followers INTEGER DEFAULT 0,
-        invite_code VARCHAR(5),
         CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
       )
     `);
@@ -575,29 +574,6 @@ const initDatabase = async () => {
     `);
 
     console.log('Bookmarks table initialized successfully');
-
-    // ============================================
-    // INVITE CODES TABLE
-    // ============================================
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS invite_codes (
-        id SERIAL PRIMARY KEY,
-        code VARCHAR(5) UNIQUE NOT NULL,
-        name VARCHAR(255) NOT NULL,
-        description TEXT,
-        active BOOLEAN DEFAULT TRUE,
-        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_invite_codes_code ON invite_codes(code);
-      CREATE INDEX IF NOT EXISTS idx_invite_codes_active ON invite_codes(active);
-    `);
-
-    console.log('Invite codes table initialized successfully');
 
     // ============================================
     // REDFLAGGED TABLES
@@ -1704,298 +1680,10 @@ app.delete('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
   }
 });
 
-// ============================================
-// INVITE CODE ROUTES
-// ============================================
-
-// Validate invite code (public route)
-app.get('/api/invite-codes/validate/:code', async (req, res) => {
-  try {
-    const { code } = req.params;
-    
-    // Check if code exists and is active
-    const result = await pool.query(
-      'SELECT code, name, description FROM invite_codes WHERE code = $1 AND active = TRUE',
-      [code.toUpperCase()]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ valid: false, error: 'Invalid or inactive invite code' });
-    }
-    
-    res.json({ 
-      valid: true, 
-      code: result.rows[0].code,
-      name: result.rows[0].name,
-      description: result.rows[0].description
-    });
-  } catch (error) {
-    console.error('Validate invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get all invite codes (admin only)
-app.get('/api/admin/invite-codes', authenticateAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT 
-        ic.*,
-        u.display_name as created_by_name,
-        COUNT(DISTINCT us.id) as total_users
-      FROM invite_codes ic
-      LEFT JOIN users u ON ic.created_by = u.id
-      LEFT JOIN users us ON us.invite_code = ic.code
-      GROUP BY ic.id, u.display_name
-      ORDER BY ic.created_at DESC
-    `);
-    
-    res.json({ codes: result.rows });
-  } catch (error) {
-    console.error('Get invite codes error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get invite code leaderboard (admin only)
-app.get('/api/admin/invite-codes/leaderboard', authenticateAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT 
-        ic.code,
-        ic.name,
-        ic.description,
-        ic.active,
-        COUNT(DISTINCT u.id) as user_count,
-        ic.created_at
-      FROM invite_codes ic
-      LEFT JOIN users u ON u.invite_code = ic.code
-      GROUP BY ic.id, ic.code, ic.name, ic.description, ic.active, ic.created_at
-      HAVING COUNT(DISTINCT u.id) > 0
-      ORDER BY user_count DESC, ic.created_at DESC
-    `);
-    
-    res.json({ leaderboard: result.rows });
-  } catch (error) {
-    console.error('Get invite code leaderboard error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get users by invite code (admin only)
-app.get('/api/admin/invite-codes/:code/users', authenticateAdmin, async (req, res) => {
-  try {
-    const { code } = req.params;
-    
-    const result = await pool.query(`
-      SELECT 
-        u.id,
-        u.display_name,
-        u.email,
-        u.tier,
-        u.role,
-        u.created_at,
-        u.urown_score
-      FROM users u
-      WHERE u.invite_code = $1
-      ORDER BY u.created_at DESC
-    `, [code.toUpperCase()]);
-    
-    res.json({ users: result.rows });
-  } catch (error) {
-    console.error('Get users by invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Create invite code (admin only)
-app.post('/api/admin/invite-codes', authenticateAdmin, async (req, res) => {
-  try {
-    const { code, name, description } = req.body;
-    const adminId = req.user.userId;
-    
-    // Validate input
-    if (!code || !name) {
-      return res.status(400).json({ error: 'Code and name are required' });
-    }
-    
-    // Validate code format (5 characters, alphanumeric)
-    if (!/^[A-Z0-9]{5}$/.test(code.toUpperCase())) {
-      return res.status(400).json({ error: 'Code must be exactly 5 alphanumeric characters' });
-    }
-    
-    // Check if code already exists
-    const existingCode = await pool.query(
-      'SELECT id FROM invite_codes WHERE code = $1',
-      [code.toUpperCase()]
-    );
-    
-    if (existingCode.rows.length > 0) {
-      return res.status(400).json({ error: 'This invite code already exists' });
-    }
-    
-    // Create invite code
-    const result = await pool.query(
-      `INSERT INTO invite_codes (code, name, description, created_by)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [code.toUpperCase(), name.trim(), description?.trim() || null, adminId]
-    );
-    
-    // Log action
-    await logAdminAction(
-      adminId,
-      'create',
-      'invite_code',
-      result.rows[0].id,
-      `Created invite code: ${code.toUpperCase()} (${name})`
-    );
-    
-    res.status(201).json({
-      message: 'Invite code created successfully',
-      code: result.rows[0]
-    });
-  } catch (error) {
-    console.error('Create invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update invite code (admin only)
-app.put('/api/admin/invite-codes/:id', authenticateAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, description, active } = req.body;
-    
-    // Check if code exists
-    const codeCheck = await pool.query(
-      'SELECT * FROM invite_codes WHERE id = $1',
-      [id]
-    );
-    
-    if (codeCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Invite code not found' });
-    }
-    
-    // Update invite code
-    const result = await pool.query(
-      `UPDATE invite_codes 
-       SET name = COALESCE($1, name),
-           description = COALESCE($2, description),
-           active = COALESCE($3, active),
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $4
-       RETURNING *`,
-      [name?.trim(), description?.trim(), active, id]
-    );
-    
-    // Log action
-    await logAdminAction(
-      req.user.userId,
-      'update',
-      'invite_code',
-      parseInt(id),
-      `Updated invite code: ${result.rows[0].code}`
-    );
-    
-    res.json({
-      message: 'Invite code updated successfully',
-      code: result.rows[0]
-    });
-  } catch (error) {
-    console.error('Update invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Toggle invite code active status (admin only)
-app.patch('/api/admin/invite-codes/:id/toggle', authenticateAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    const result = await pool.query(
-      `UPDATE invite_codes 
-       SET active = NOT active,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1
-       RETURNING *`,
-      [id]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Invite code not found' });
-    }
-    
-    // Log action
-    await logAdminAction(
-      req.user.userId,
-      result.rows[0].active ? 'activate' : 'deactivate',
-      'invite_code',
-      parseInt(id),
-      `${result.rows[0].active ? 'Activated' : 'Deactivated'} invite code: ${result.rows[0].code}`
-    );
-    
-    res.json({
-      message: `Invite code ${result.rows[0].active ? 'activated' : 'deactivated'} successfully`,
-      code: result.rows[0]
-    });
-  } catch (error) {
-    console.error('Toggle invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Delete invite code (admin only)
-app.delete('/api/admin/invite-codes/:id', authenticateAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    // Get code info before deletion
-    const codeResult = await pool.query(
-      'SELECT * FROM invite_codes WHERE id = $1',
-      [id]
-    );
-    
-    if (codeResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Invite code not found' });
-    }
-    
-    const code = codeResult.rows[0];
-    
-    // Check if any users are using this code
-    const userCount = await pool.query(
-      'SELECT COUNT(*) as count FROM users WHERE invite_code = $1',
-      [code.code]
-    );
-    
-    const count = parseInt(userCount.rows[0].count);
-    
-    // Delete invite code
-    await pool.query('DELETE FROM invite_codes WHERE id = $1', [id]);
-    
-    // Log action
-    await logAdminAction(
-      req.user.userId,
-      'delete',
-      'invite_code',
-      parseInt(id),
-      `Deleted invite code: ${code.code} (${code.name}) - ${count} users affected`
-    );
-    
-    res.json({ 
-      message: 'Invite code deleted successfully',
-      users_affected: count
-    });
-  } catch (error) {
-    console.error('Delete invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
 // Signup
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, phone, full_name, display_name, discord_username, date_of_birth, password, invite_code, terms_agreed } = req.body;
+    const { email, phone, full_name, display_name, discord_username, date_of_birth, password, terms_agreed } = req.body;
     
     // Manual validation for better error messages
     const errors = {};
@@ -2025,23 +1713,6 @@ app.post('/api/auth/signup', async (req, res) => {
     // Discord username validation (optional)
     if (discord_username && discord_username.trim().length > 0 && discord_username.trim().length < 2) {
       errors.discord_username = 'Discord username must be at least 2 characters';
-    }
-    
-    // Invite code validation (optional)
-    if (invite_code && invite_code.trim().length > 0) {
-      if (invite_code.trim().length !== 5) {
-        errors.invite_code = 'Invite code must be exactly 5 characters';
-      } else {
-        // Check if invite code exists and is active
-        const inviteCheck = await pool.query(
-          'SELECT id FROM invite_codes WHERE code = $1 AND active = TRUE',
-          [invite_code.toUpperCase()]
-        );
-        
-        if (inviteCheck.rows.length === 0) {
-          errors.invite_code = 'Invalid or inactive invite code';
-        }
-      }
     }
     
     // Date of birth validation
@@ -2102,22 +1773,12 @@ app.post('/api/auth/signup', async (req, res) => {
     const saltRounds = 12;
     const password_hash = await bcrypt.hash(password, saltRounds);
 
-    // Create user with invite code
+    // Create user
     const result = await pool.query(
-      `INSERT INTO users (email, phone, full_name, display_name, discord_username, date_of_birth, password_hash, invite_code, terms_agreed)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, invite_code, created_at`,
-      [
-        email, 
-        phone || null, 
-        full_name || null, 
-        display_name, 
-        discord_username || null, 
-        date_of_birth, 
-        password_hash, 
-        invite_code ? invite_code.toUpperCase() : null,
-        terms_agreed
-      ]
+      `INSERT INTO users (email, phone, full_name, display_name, discord_username, date_of_birth, password_hash, terms_agreed)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, created_at`,
+      [email, phone || null, full_name || null, display_name, discord_username || null, date_of_birth, password_hash, terms_agreed]
     );
 
     const user = result.rows[0];
@@ -2141,7 +1802,6 @@ app.post('/api/auth/signup', async (req, res) => {
         discord_username: user.discord_username,
         tier: user.tier,
         role: user.role,
-        invite_code: user.invite_code,
         created_at: user.created_at
       }
     });
@@ -2271,8 +1931,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
               weekly_articles_count, weekly_reset_date, 
               display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
               discord_username_updated_at, created_at, followers, urown_score,
-              ideology, ideology_details, ideology_public, ideology_updated_at,
-              invite_code
+              ideology, ideology_details, ideology_public, ideology_updated_at
        FROM users 
        WHERE id = $1`,
       [req.user.userId]
@@ -3192,8 +2851,7 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
     const result = await pool.query(
       `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.discord_username, u.tier, u.role, 
               u.weekly_articles_count, u.created_at, u.updated_at, u.urown_score,
-              ub.ban_end, ub.reason as ban_reason,
-              u.invite_code
+              ub.ban_end, ub.reason as ban_reason
        FROM users u
        LEFT JOIN user_bans ub ON u.id = ub.user_id AND ub.ban_end > CURRENT_TIMESTAMP
        WHERE u.account_status = 'active'
@@ -3215,8 +2873,7 @@ app.get('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
     const result = await pool.query(
       `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.discord_username, u.tier, u.role, 
               u.weekly_articles_count, u.created_at, u.updated_at, u.urown_score,
-              ub.ban_end, ub.reason as ban_reason,
-              u.invite_code
+              ub.ban_end, ub.reason as ban_reason
        FROM users u
        LEFT JOIN user_bans ub ON u.id = ub.user_id AND ub.ban_end > CURRENT_TIMESTAMP
        WHERE u.id = $1`,
@@ -3968,6 +3625,7 @@ app.get('/api/users/:display_name', async (req, res) => {
 });
 
 // Follow a user
+// Follow a user
 app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
   const client = await pool.connect();
   
@@ -4032,6 +3690,7 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
   }
 });
 
+// Unfollow a user
 // Unfollow a user
 app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -5732,7 +5391,7 @@ setInterval(async () => {
 }, 60 * 60 * 1000); // Every hour
 
 // Add this catch-all route at very end, before error handling middleware
-// This serves React app for any route that doesn't match API routes
+// This serves the React app for any route that doesn't match API routes
 app.get('*', (req, res) => {
   if (fs.existsSync(buildPath)) {
     res.sendFile(path.join(buildPath, 'index.html'));
