@@ -40,7 +40,6 @@ if (process.env.DATABASE_URL) {
 }
 
 // Middleware
-// More permissive CORS for production
 app.use(cors({
   origin: [
     'https://urown-delta.vercel.app',
@@ -52,85 +51,24 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Handle preflight requests
 app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Serve static files from the React app
+// Serve static files
 const buildPath = path.join(__dirname, '../urown-frontend/build');
 const publicPath = path.join(__dirname, '../urown-frontend/public');
 
-// Check if build directory exists before serving it
 if (fs.existsSync(buildPath)) {
   app.use(express.static(buildPath));
 } else {
   console.log('Build directory not found. Using public directory for static files.');
 }
 
-// Check if public directory exists before serving it
 if (fs.existsSync(publicPath)) {
   app.use(express.static(publicPath));
 } else {
   console.log('Public directory not found. Some static files may not be available.');
 }
-
-// Handle specific static files explicitly with fallbacks
-app.get('/favicon.ico', (req, res) => {
-  const faviconPath = path.join(publicPath, 'favicon.ico');
-  if (fs.existsSync(faviconPath)) {
-    res.sendFile(faviconPath);
-  } else {
-    res.status(404).send('Favicon not found');
-  }
-});
-
-app.get('/apple-touch-icon.png', (req, res) => {
-  const iconPath = path.join(publicPath, 'apple-touch-icon.png');
-  if (fs.existsSync(iconPath)) {
-    res.sendFile(iconPath);
-  } else {
-    // Create a simple 180x180 PNG icon as a fallback
-    try {
-      // Try to use canvas if available
-      const { createCanvas } = require('canvas');
-      const canvas = createCanvas(180, 180);
-      const ctx = canvas.getContext('2d');
-      
-      // Draw a simple icon
-      ctx.fillStyle = '#4F46E5'; // Indigo color
-      ctx.fillRect(0, 0, 180, 180);
-      ctx.fillStyle = '#FFFFFF';
-      ctx.font = 'bold 80px Arial';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('U', 90, 90);
-      
-      // Convert to PNG and send
-      res.type('png');
-      res.send(canvas.toBuffer());
-    } catch (err) {
-      // If canvas module is not available, create a simple SVG icon
-      const svgIcon = `
-        <svg width="180" height="180" xmlns="http://www.w3.org/2000/svg">
-          <rect width="180" height="180" fill="#4F46E5"/>
-          <text x="90" y="90" font-family="Arial" font-size="80" font-weight="bold" 
-                text-anchor="middle" dominant-baseline="middle" fill="white">U</text>
-        </svg>
-      `;
-      res.setHeader('Content-Type', 'image/svg+xml');
-      res.send(svgIcon);
-    }
-  }
-});
-
-app.get('/manifest.json', (req, res) => {
-  const manifestPath = path.join(publicPath, 'manifest.json');
-  if (fs.existsSync(manifestPath)) {
-    res.sendFile(manifestPath);
-  } else {
-    res.status(404).send('Manifest not found');
-  }
-});
 
 // Session configuration
 app.use(session({
@@ -142,13 +80,13 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+    maxAge: 30 * 24 * 60 * 60 * 1000,
     secure: process.env.NODE_ENV === 'production',
     httpOnly: true
   }
 }));
 
-// Environment-based rate limiting
+// Rate limiting
 const isDevelopment = process.env.NODE_ENV === 'development';
 
 const generalLimiter = rateLimit({
@@ -159,7 +97,6 @@ const generalLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// More lenient rate limiting for authenticated routes
 const authLimiter = rateLimit({
   windowMs: parseInt(process.env.AUTH_RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
   max: isDevelopment ? 20000 : parseInt(process.env.AUTH_RATE_LIMIT_MAX_REQUESTS) || 2000,
@@ -169,18 +106,261 @@ const authLimiter = rateLimit({
   skip: (req) => !req.user,
 });
 
-// Apply general limiter to all routes
 app.use('/api', generalLimiter);
-
-// Apply more lenient limiter to authenticated routes
 app.use('/api/user', authLimiter);
+
+// Helper function to award points
+const awardPoints = async (userId, activityType, points, referenceId = null, referenceType = null) => {
+  try {
+    await pool.query(
+      'SELECT update_user_score($1, $2, $3, $4, $5)',
+      [userId, activityType, points, referenceId, referenceType]
+    );
+  } catch (error) {
+    console.error('Error awarding points:', error);
+  }
+};
+
+// JWT middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, async (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    
+    // Check if user is banned
+    try {
+      const banResult = await pool.query(
+        'SELECT ban_end, reason FROM user_bans WHERE user_id = $1 AND ban_end > CURRENT_TIMESTAMP',
+        [user.userId]
+      );
+
+      if (banResult.rows.length > 0) {
+        const ban = banResult.rows[0];
+        const banEnd = new Date(ban.ban_end);
+        const now = new Date();
+        const diffMs = banEnd - now;
+        const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+        const diffHours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+
+        let timeLeft = '';
+        if (diffDays > 0) {
+          timeLeft = `${diffDays} day${diffDays !== 1 ? 's' : ''}`;
+          if (diffHours > 0) {
+            timeLeft += ` and ${diffHours} hour${diffHours !== 1 ? 's' : ''}`;
+          }
+        } else {
+          timeLeft = `${diffHours} hour${diffHours !== 1 ? 's' : ''}`;
+        }
+
+        return res.status(401).json({ 
+          error: `Your account has been banned. Reason: "${ban.reason}." The ban will expire in ${timeLeft}. If you disagree contact us at, nilecommun@gmail.com` 
+        });
+      }
+    } catch (error) {
+      console.error('Error checking ban status:', error);
+    }
+
+    req.user = user;
+    next();
+  });
+};
+
+// Middleware to check if user is an admin
+const authenticateAdmin = (req, res, next) => {
+  authenticateToken(req, res, async () => {
+    try {
+      const result = await pool.query(
+        'SELECT role FROM users WHERE id = $1',
+        [req.user.userId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(401).json({ 
+          error: 'User not found. Your session may have expired. Please log in again.' 
+        });
+      }
+
+      const user = result.rows[0];
+      
+      if (user.role !== 'admin' && user.role !== 'super-admin') {
+        return res.status(403).json({ error: 'Access denied. Admin privileges required.' });
+      }
+
+      req.user.role = user.role;
+      next();
+    } catch (error) {
+      console.error('Admin authentication error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+};
+
+// Middleware to check if user is a super-admin
+const authenticateSuperAdmin = (req, res, next) => {
+  authenticateToken(req, res, async () => {
+    try {
+      const result = await pool.query(
+        'SELECT role FROM users WHERE id = $1',
+        [req.user.userId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      const user = result.rows[0];
+      
+      if (user.role !== 'super-admin') {
+        return res.status(403).json({ error: 'Access denied. Super-admin privileges required.' });
+      }
+
+      req.user.role = user.role;
+      next();
+    } catch (error) {
+      console.error('Super-admin authentication error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+};
+
+// Middleware to check if user is an editorial board member
+const authenticateEditorialBoard = (req, res, next) => {
+  authenticateToken(req, res, async () => {
+    try {
+      const result = await pool.query(
+        'SELECT role FROM users WHERE id = $1',
+        [req.user.userId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      const user = result.rows[0];
+      
+      if (user.role !== 'editorial-board' && user.role !== 'admin' && user.role !== 'super-admin') {
+        return res.status(403).json({ error: 'Access denied. Editorial board privileges required.' });
+      }
+
+      req.user.role = user.role;
+      next();
+    } catch (error) {
+      console.error('Editorial board authentication error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+};
+
+// Function to log admin actions
+const logAdminAction = async (adminId, action, targetType, targetId, details = null) => {
+  try {
+    await pool.query(
+      `INSERT INTO audit_log (admin_id, action, target_type, target_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [adminId, action, targetType, targetId, details]
+    );
+  } catch (error) {
+    console.error('Error logging admin action:', error);
+  }
+};
+
+// EBOOK TABLES INITIALIZATION FUNCTION
+const initEbookTables = async () => {
+  try {
+    // Create ebooks table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ebooks (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        subtitle VARCHAR(255),
+        description TEXT,
+        cover_color VARCHAR(7) DEFAULT '#667eea',
+        language VARCHAR(10) DEFAULT 'en',
+        length VARCHAR(20) DEFAULT 'short',
+        tags JSONB DEFAULT '[]',
+        license VARCHAR(50) DEFAULT 'all-rights-reserved',
+        isbn VARCHAR(20),
+        published BOOLEAN DEFAULT FALSE,
+        views INTEGER DEFAULT 0,
+        chapter_count INTEGER DEFAULT 0,
+        total_word_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        published_at TIMESTAMP
+      )
+    `);
+
+    // Create chapters table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ebook_chapters (
+        id SERIAL PRIMARY KEY,
+        ebook_id INTEGER REFERENCES ebooks(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        content TEXT NOT NULL,
+        chapter_order INTEGER NOT NULL,
+        word_count INTEGER DEFAULT 0,
+        status VARCHAR(20) DEFAULT 'draft',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create reading progress table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ebook_reading_progress (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        ebook_id INTEGER REFERENCES ebooks(id) ON DELETE CASCADE,
+        current_chapter_id INTEGER REFERENCES ebook_chapters(id) ON DELETE SET NULL,
+        progress_percent INTEGER DEFAULT 0,
+        last_read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, ebook_id)
+      )
+    `);
+
+    // Add weekly ebook tracking to users table
+    try {
+      await pool.query(`
+        ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS weekly_ebooks_count INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS weekly_ebooks_reset_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      `);
+      console.log('Added ebook tracking columns to users table');
+    } catch (error) {
+      console.log('Ebook tracking columns may already exist:', error.message);
+    }
+
+    // Create indexes for better performance
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_ebooks_user_id ON ebooks(user_id);
+      CREATE INDEX IF NOT EXISTS idx_ebooks_published ON ebooks(published);
+      CREATE INDEX IF NOT EXISTS idx_ebooks_created_at ON ebooks(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ebook_chapters_ebook_id ON ebook_chapters(ebook_id);
+      CREATE INDEX IF NOT EXISTS idx_ebook_chapters_order ON ebook_chapters(ebook_id, chapter_order);
+      CREATE INDEX IF NOT EXISTS idx_reading_progress_user_ebook ON ebook_reading_progress(user_id, ebook_id);
+    `);
+
+    console.log('E-book tables initialized successfully');
+  } catch (error) {
+    console.error('Error initializing ebook tables:', error);
+    throw error;
+  }
+};
 
 // Database initialization
 const initDatabase = async () => {
   try {
     // Check if the full_name column needs to be modified
     try {
-      // First check if the column exists and its constraints
       const columnCheck = await pool.query(`
         SELECT column_name, is_nullable 
         FROM information_schema.columns 
@@ -188,7 +368,6 @@ const initDatabase = async () => {
       `);
       
       if (columnCheck.rows.length > 0 && columnCheck.rows[0].is_nullable === 'NO') {
-        // If the column exists but doesn't allow NULL, alter it
         await pool.query(`
           ALTER TABLE users ALTER COLUMN full_name DROP NOT NULL
         `);
@@ -198,7 +377,7 @@ const initDatabase = async () => {
       console.log('Could not alter full_name column:', alterError.message);
     }
     
-    // Create users table first (no dependencies)
+    // Create users table first
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -242,7 +421,7 @@ const initDatabase = async () => {
       console.log('Discord username columns may already exist:', error.message);
     }
 
-    // Create index for faster lookups (optional but recommended)
+    // Create index for faster lookups
     try {
       await pool.query(`
         CREATE INDEX IF NOT EXISTS idx_users_discord_username ON users(discord_username)
@@ -273,7 +452,6 @@ const initDatabase = async () => {
       ADD COLUMN IF NOT EXISTS last_score_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     `);
 
-    // Create index for faster leaderboard queries
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_users_urown_score ON users(urown_score DESC)
     `);
@@ -321,7 +499,8 @@ const initDatabase = async () => {
         p_points INTEGER,
         p_reference_id INTEGER DEFAULT NULL,
         p_reference_type VARCHAR(50) DEFAULT NULL
-      ) RETURNS INTEGER AS $$       DECLARE
+      ) RETURNS INTEGER AS $$       
+      DECLARE
         v_new_score INTEGER;
         v_old_rank INTEGER;
         v_new_rank INTEGER;
@@ -397,7 +576,7 @@ const initDatabase = async () => {
       )
     `);
 
-    // Create debate_topics table (referenced by articles)
+    // Create debate_topics table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS debate_topics (
         id SERIAL PRIMARY KEY,
@@ -409,7 +588,7 @@ const initDatabase = async () => {
       )
     `);
 
-    // Create articles table (references debate_topics)
+    // Create articles table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS articles (
         id SERIAL PRIMARY KEY,
@@ -549,7 +728,6 @@ const initDatabase = async () => {
       )
     `);
 
-    // Create index for faster queries
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
       CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
@@ -566,7 +744,6 @@ const initDatabase = async () => {
       )
     `);
 
-    // Create indexes for faster queries
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_bookmarks_user_id ON bookmarks(user_id);
       CREATE INDEX IF NOT EXISTS idx_bookmarks_article_id ON bookmarks(article_id);
@@ -576,92 +753,9 @@ const initDatabase = async () => {
     console.log('Bookmarks table initialized successfully');
 
     // ============================================
-    // EBOOKS TABLES
-
-    const initEbookTables = async () => {
+    // EBOOKS TABLES - NOW PROPERLY CALLED
     await initEbookTables();
-  try {
-    // Create ebooks table
-   await pool.query(`
-      CREATE TABLE IF NOT EXISTS ebooks (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        title VARCHAR(255) NOT NULL,
-        subtitle VARCHAR(255),
-        description TEXT,
-        cover_color VARCHAR(7) DEFAULT '#667eea',
-        language VARCHAR(10) DEFAULT 'en',
-        length VARCHAR(20) DEFAULT 'short',
-        tags JSONB DEFAULT '[]',
-        license VARCHAR(50) DEFAULT 'all-rights-reserved',
-        isbn VARCHAR(20),
-        published BOOLEAN DEFAULT FALSE,
-        views INTEGER DEFAULT 0,
-        chapter_count INTEGER DEFAULT 0,
-        total_word_count INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        published_at TIMESTAMP
-      )
-    `);
-
-    // Create chapters table
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ebook_chapters (
-        id SERIAL PRIMARY KEY,
-        ebook_id INTEGER REFERENCES ebooks(id) ON DELETE CASCADE,
-        title VARCHAR(255) NOT NULL,
-        content TEXT NOT NULL,
-        chapter_order INTEGER NOT NULL,
-        word_count INTEGER DEFAULT 0,
-        status VARCHAR(20) DEFAULT 'draft',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    // Create reading progress table
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ebook_reading_progress (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        ebook_id INTEGER REFERENCES ebooks(id) ON DELETE CASCADE,
-        current_chapter_id INTEGER REFERENCES ebook_chapters(id) ON DELETE SET NULL,
-        progress_percent INTEGER DEFAULT 0,
-        last_read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_id, ebook_id)
-      )
-    `);
-
-    // Add weekly ebook tracking to users table
-    try {
-      await pool.query(`
-        ALTER TABLE users 
-        ADD COLUMN IF NOT EXISTS weekly_ebooks_count INTEGER DEFAULT 0,
-        ADD COLUMN IF NOT EXISTS weekly_ebooks_reset_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      `);
-      console.log('Added ebook tracking columns to users table');
-    } catch (error) {
-      console.log('Ebook tracking columns may already exist:', error.message);
-    }
-
-    // Create indexes for better performance
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_ebooks_user_id ON ebooks(user_id);
-      CREATE INDEX IF NOT EXISTS idx_ebooks_published ON ebooks(published);
-      CREATE INDEX IF NOT EXISTS idx_ebooks_created_at ON ebooks(created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_ebook_chapters_ebook_id ON ebook_chapters(ebook_id);
-      CREATE INDEX IF NOT EXISTS idx_ebook_chapters_order ON ebook_chapters(ebook_id, chapter_order);
-      CREATE INDEX IF NOT EXISTS idx_reading_progress_user_ebook ON ebook_reading_progress(user_id, ebook_id);
-    `);
-
-    console.log('E-book tables initialized successfully');
-  } catch (error) {
-    console.error('Error initializing ebook tables:', error);
-    throw error;
-  }
-};
-
+    
     // ============================================
     // REDFLAGGED TABLES
     // ============================================
@@ -737,7 +831,8 @@ const initDatabase = async () => {
     // Create trigger function to create notification on new follower
     await pool.query(`
       CREATE OR REPLACE FUNCTION notify_new_follower()
-      RETURNS TRIGGER AS $$       BEGIN
+      RETURNS TRIGGER AS $$       
+      BEGIN
         INSERT INTO notifications (user_id, type, message, link)
         VALUES (
           NEW.following_id,
@@ -761,7 +856,8 @@ const initDatabase = async () => {
     // Create trigger function to create notification on counter argument
     await pool.query(`
       CREATE OR REPLACE FUNCTION notify_counter_argument()
-      RETURNS TRIGGER AS $$       DECLARE
+      RETURNS TRIGGER AS $$       
+      DECLARE
         parent_user_id INTEGER;
         parent_title TEXT;
       BEGIN
@@ -798,7 +894,8 @@ const initDatabase = async () => {
     // Create trigger function to notify followers of new posts
     await pool.query(`
       CREATE OR REPLACE FUNCTION notify_followers_new_post()
-      RETURNS TRIGGER AS $$       BEGIN
+      RETURNS TRIGGER AS $$       
+      BEGIN
         IF NEW.published = TRUE AND NEW.parent_article_id IS NULL AND NEW.debate_topic_id IS NULL THEN
           INSERT INTO notifications (user_id, type, message, link)
           SELECT 
@@ -858,173 +955,7 @@ const initDatabase = async () => {
   }
 };
 
-// Helper function to award points
-const awardPoints = async (userId, activityType, points, referenceId = null, referenceType = null) => {
-  try {
-    await pool.query(
-      'SELECT update_user_score($1, $2, $3, $4, $5)',
-      [userId, activityType, points, referenceId, referenceType]
-    );
-  } catch (error) {
-    console.error('Error awarding points:', error);
-  }
-};
-
-// JWT middleware
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
-  }
-
-  jwt.verify(token, process.env.JWT_SECRET, async (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-    
-    // Check if user is banned
-    try {
-      const banResult = await pool.query(
-        'SELECT ban_end, reason FROM user_bans WHERE user_id = $1 AND ban_end > CURRENT_TIMESTAMP',
-        [user.userId]
-      );
-
-      if (banResult.rows.length > 0) {
-        const ban = banResult.rows[0];
-        // Calculate remaining time in a human-readable format
-        const banEnd = new Date(ban.ban_end);
-        const now = new Date();
-        const diffMs = banEnd - now;
-        const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-        const diffHours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-
-        let timeLeft = '';
-        if (diffDays > 0) {
-          timeLeft = `${diffDays} day${diffDays !== 1 ? 's' : ''}`;
-          if (diffHours > 0) {
-            timeLeft += ` and ${diffHours} hour${diffHours !== 1 ? 's' : ''}`;
-          }
-        } else {
-          timeLeft = `${diffHours} hour${diffHours !== 1 ? 's' : ''}`;
-        }
-
-        return res.status(401).json({ 
-          error: `Your account has been banned. Reason: "${ban.reason}." The ban will expire in ${timeLeft}. If you disagree contact us at, nilecommun@gmail.com` 
-        });
-      }
-    } catch (error) {
-      console.error('Error checking ban status:', error);
-      // Continue to next if there's an error checking ban
-    }
-
-    req.user = user;
-    next();
-  });
-};
-
-// Middleware to check if user is an admin
-const authenticateAdmin = (req, res, next) => {
-  authenticateToken(req, res, async () => {
-    try {
-      const result = await pool.query(
-        'SELECT role FROM users WHERE id = $1',
-        [req.user.userId]
-      );
-
-      if (result.rows.length === 0) {
-        console.error(`User not found in database: ${req.user.userId}`);
-        return res.status(401).json({ 
-          error: 'User not found. Your session may have expired. Please log in again.' 
-        });
-      }
-
-      const user = result.rows[0];
-      
-      if (user.role !== 'admin' && user.role !== 'super-admin') {
-        return res.status(403).json({ error: 'Access denied. Admin privileges required.' });
-      }
-
-      req.user.role = user.role;
-      next();
-    } catch (error) {
-      console.error('Admin authentication error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  });
-};
-
-// Middleware to check if user is a super-admin
-const authenticateSuperAdmin = (req, res, next) => {
-  authenticateToken(req, res, async () => {
-    try {
-      const result = await pool.query(
-        'SELECT role FROM users WHERE id = $1',
-        [req.user.userId]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      const user = result.rows[0];
-      
-      if (user.role !== 'super-admin') {
-        return res.status(403).json({ error: 'Access denied. Super-admin privileges required.' });
-      }
-
-      req.user.role = user.role;
-      next();
-    } catch (error) {
-      console.error('Super-admin authentication error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  });
-};
-
-// Middleware to check if user is an editorial board member
-const authenticateEditorialBoard = (req, res, next) => {
-  authenticateToken(req, res, async () => {
-    try {
-      const result = await pool.query(
-        'SELECT role FROM users WHERE id = $1',
-        [req.user.userId]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      const user = result.rows[0];
-      
-      if (user.role !== 'editorial-board' && user.role !== 'admin' && user.role !== 'super-admin') {
-        return res.status(403).json({ error: 'Access denied. Editorial board privileges required.' });
-      }
-
-      req.user.role = user.role;
-      next();
-    } catch (error) {
-      console.error('Editorial board authentication error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  });
-};
-
-// Function to log admin actions
-const logAdminAction = async (adminId, action, targetType, targetId, details = null) => {
-  try {
-    await pool.query(
-      `INSERT INTO audit_log (admin_id, action, target_type, target_id, details)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [adminId, action, targetType, targetId, details]
-    );
-  } catch (error) {
-    console.error('Error logging admin action:', error);
-  }
-};
-
-// server.js - Update the validateSignup middleware
+// Validation middleware
 const validateSignup = [
   body('email').notEmpty().withMessage('Email is required')
     .isEmail().normalizeEmail().withMessage('Please enter a valid email address'),
@@ -1038,7 +969,6 @@ const validateSignup = [
   (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      // Return more detailed error information
       const errorMessages = errors.array().map(error => error.msg);
       return res.status(400).json({ 
         error: 'Validation failed', 
@@ -1088,7 +1018,6 @@ app.post('/api/contact', async (req, res) => {
   try {
     const { name, email, phone, category, content } = req.body;
 
-    // Validate input
     if (!name || !name.trim()) {
       return res.status(400).json({ error: 'Name is required' });
     }
@@ -1109,7 +1038,6 @@ app.post('/api/contact', async (req, res) => {
       return res.status(400).json({ error: 'Content is required' });
     }
 
-    // Insert into database
     const result = await pool.query(
       `INSERT INTO contact_messages (name, email, phone, category, content)
        VALUES ($1, $2, $3, $4, $5)
@@ -1172,13 +1100,11 @@ app.put('/api/admin/contacts/:id/status', authenticateSuperAdmin, async (req, re
     const { id } = req.params;
     const { status } = req.body;
 
-    // Validate status
     const validStatuses = ['waiting', 'in_progress', 'resolved'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
-    // Check if contact message exists
     const contactResult = await pool.query(
       'SELECT * FROM contact_messages WHERE id = $1',
       [id]
@@ -1188,7 +1114,6 @@ app.put('/api/admin/contacts/:id/status', authenticateSuperAdmin, async (req, re
       return res.status(404).json({ error: 'Contact message not found' });
     }
 
-    // Update status
     await pool.query(
       'UPDATE contact_messages SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
       [status, id]
@@ -1206,7 +1131,6 @@ app.delete('/api/admin/contacts/:id', authenticateSuperAdmin, async (req, res) =
   try {
     const { id } = req.params;
 
-    // Check if contact message exists
     const contactResult = await pool.query(
       'SELECT * FROM contact_messages WHERE id = $1',
       [id]
@@ -1216,7 +1140,6 @@ app.delete('/api/admin/contacts/:id', authenticateSuperAdmin, async (req, res) =
       return res.status(404).json({ error: 'Contact message not found' });
     }
 
-    // Delete contact message
     await pool.query('DELETE FROM contact_messages WHERE id = $1', [id]);
 
     res.json({ message: 'Contact message deleted successfully' });
@@ -1233,7 +1156,6 @@ app.post('/api/articles/:id/report', authenticateToken, async (req, res) => {
     const { reason } = req.body;
     const userId = req.user.userId;
 
-    // Check if article exists
     const articleResult = await pool.query(
       'SELECT * FROM articles WHERE id = $1',
       [id]
@@ -1243,7 +1165,6 @@ app.post('/api/articles/:id/report', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Article not found' });
     }
 
-    // Check if user has already reported this article
     const existingReport = await pool.query(
       'SELECT id FROM reported_articles WHERE article_id = $1 AND user_id = $2',
       [id, userId]
@@ -1253,7 +1174,6 @@ app.post('/api/articles/:id/report', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'You have already reported this article' });
     }
 
-    // Create report
     const result = await pool.query(
       `INSERT INTO reported_articles (article_id, user_id, reason)
        VALUES ($1, $2, $3)
@@ -1311,13 +1231,11 @@ app.put('/api/admin/reported-articles/:id/status', authenticateAdmin, async (req
     const { id } = req.params;
     const { status } = req.body;
 
-    // Validate status
     const validStatuses = ['pending', 'reviewed', 'resolved', 'dismissed'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
-    // Check if report exists
     const reportResult = await pool.query(
       'SELECT * FROM reported_articles WHERE id = $1',
       [id]
@@ -1327,7 +1245,6 @@ app.put('/api/admin/reported-articles/:id/status', authenticateAdmin, async (req
       return res.status(404).json({ error: 'Report not found' });
     }
 
-    // Update status
     await pool.query(
       'UPDATE reported_articles SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
       [status, id]
@@ -1345,7 +1262,6 @@ app.delete('/api/admin/articles/:id/delete', authenticateAdmin, async (req, res)
   try {
     const { id } = req.params;
 
-    // Get article data before deletion for logging
     const articleResult = await pool.query(
       `SELECT a.*, u.display_name as author_name 
        FROM articles a
@@ -1360,10 +1276,8 @@ app.delete('/api/admin/articles/:id/delete', authenticateAdmin, async (req, res)
     
     const article = articleResult.rows[0];
     
-    // Delete article
     await pool.query('DELETE FROM articles WHERE id = $1', [id]);
     
-    // Log the action
     await logAdminAction(
       req.user.userId,
       'delete_reported',
@@ -1389,7 +1303,6 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
       return res.status(400).json({ error: 'Reason is required' });
     }
 
-    // Check if user exists
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1',
       [userId]
@@ -1401,19 +1314,16 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
 
     const user = userResult.rows[0];
 
-    // Don't allow warnings for deleted accounts
     if (user.account_status === 'soft_deleted' || user.account_status === 'hard_deleted') {
       return res.status(400).json({ error: 'Cannot warn a deleted account' });
     }
 
-    // Add the warning
     await pool.query(
       `INSERT INTO user_warnings (user_id, reason, admin_id)
        VALUES ($1, $2, $3)`,
       [userId, reason, req.user.userId]
     );
 
-    // Count warnings for this user
     const warningCountResult = await pool.query(
       'SELECT COUNT(*) as count FROM user_warnings WHERE user_id = $1',
       [userId]
@@ -1421,7 +1331,6 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
 
     const warningCount = parseInt(warningCountResult.rows[0].count);
 
-    // If user has 3 warnings, mark for deletion
     if (warningCount >= 3) {
       await pool.query(
         `UPDATE users 
@@ -1432,7 +1341,6 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
         [userId]
       );
 
-      // Log the action
       await logAdminAction(
         req.user.userId,
         'soft_delete',
@@ -1459,7 +1367,6 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
   try {
     const { userId, warningId } = req.params;
 
-    // Check if warning exists and belongs to user
     const warningResult = await pool.query(
       'SELECT * FROM user_warnings WHERE id = $1 AND user_id = $2',
       [warningId, userId]
@@ -1469,13 +1376,11 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
       return res.status(404).json({ error: 'Warning not found' });
     }
 
-    // Delete the warning
     await pool.query(
       'DELETE FROM user_warnings WHERE id = $1',
       [warningId]
     );
 
-    // Count remaining warnings
     const warningCountResult = await pool.query(
       'SELECT COUNT(*) as count FROM user_warnings WHERE user_id = $1',
       [userId]
@@ -1483,7 +1388,6 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
 
     const warningCount = parseInt(warningCountResult.rows[0].count);
 
-    // If user was soft deleted due to warnings and now has less than 3, reactivate
     if (warningCount < 3) {
       const userResult = await pool.query(
         'SELECT * FROM users WHERE id = $1',
@@ -1502,7 +1406,6 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
           [userId]
         );
 
-        // Log the action
         await logAdminAction(
           req.user.userId,
           'reactivate',
@@ -1556,7 +1459,6 @@ app.post('/api/admin/users/:userId/undo-delete', authenticateAdmin, async (req, 
   try {
     const { userId } = req.params;
 
-    // Check if user exists and is soft deleted
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1 AND account_status = $2',
       [userId, 'soft_deleted']
@@ -1568,7 +1470,6 @@ app.post('/api/admin/users/:userId/undo-delete', authenticateAdmin, async (req, 
 
     const user = userResult.rows[0];
 
-    // Reactivate the account
     await pool.query(
       `UPDATE users 
        SET account_status = 'active', 
@@ -1578,7 +1479,6 @@ app.post('/api/admin/users/:userId/undo-delete', authenticateAdmin, async (req, 
       [userId]
     );
 
-    // Log the action
     await logAdminAction(
       req.user.userId,
       'undo_delete',
@@ -3712,7 +3612,6 @@ app.get('/api/users/:display_name', async (req, res) => {
 });
 
 // Follow a user
-// Follow a user
 app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
   const client = await pool.connect();
   
@@ -3734,7 +3633,7 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
     
-    // Check if user is trying to follow themselves
+// Check if user is trying to follow themselves
     if (parseInt(id) === followerId) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'You cannot follow yourself' });
@@ -3777,7 +3676,6 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
   }
 });
 
-// Unfollow a user
 // Unfollow a user
 app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -4528,7 +4426,7 @@ app.post('/api/ebooks', authenticateToken, async (req, res) => {
     // Create ebook
     const result = await pool.query(`
       INSERT INTO ebooks (user_id, title, subtitle, description, language, cover_color)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING *
     `, [userId, title.trim(), subtitle?.trim() || null, description?.trim() || null, language || 'en', cover_color || '#667eea']);
     
@@ -5317,7 +5215,7 @@ app.post('/api/redflagged', async (req, res) => {
         rating_fairness, rating_pay, rating_culture, rating_management,
         anonymous_username, is_anonymous
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       RETURNING *`,
       [
         userId, 
@@ -5807,7 +5705,7 @@ app.put('/api/admin/redflagged/topics/:id/toggle', authenticateEditorialBoard, a
     const { id } = req.params;
     const { active } = req.body;
     
-    // If activating, check if we're at the limit
+    // If activating, check if we're at limit
     if (active) {
       const activeCountResult = await pool.query(
         'SELECT COUNT(*) as count FROM redflagged_topics WHERE active = true AND id != $1',
