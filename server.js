@@ -581,7 +581,7 @@ const initDatabase = async () => {
     const initEbookTables = async () => {
   try {
     // Create ebooks table
-    await pool.query(`
+   await pool.query(`
       CREATE TABLE IF NOT EXISTS ebooks (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -633,11 +633,16 @@ const initDatabase = async () => {
     `);
 
     // Add weekly ebook tracking to users table
-    await pool.query(`
-      ALTER TABLE users 
-      ADD COLUMN IF NOT EXISTS weekly_ebooks_count INTEGER DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS weekly_ebooks_reset_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    `);
+    try {
+      await pool.query(`
+        ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS weekly_ebooks_count INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS weekly_ebooks_reset_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      `);
+      console.log('Added ebook tracking columns to users table');
+    } catch (error) {
+      console.log('Ebook tracking columns may already exist:', error.message);
+    }
 
     // Create indexes for better performance
     await pool.query(`
@@ -4492,6 +4497,8 @@ app.get('/api/ebooks/:id', async (req, res) => {
       if (!req.session[sessionKey]) {
         await pool.query('UPDATE ebooks SET views = views + 1 WHERE id = $1', [id]);
         req.session[sessionKey] = true;
+        const updatedResult = await pool.query('SELECT views FROM ebooks WHERE id = $1', [id]);
+        ebook.views = updatedResult.rows[0].views;
       }
     }
     
@@ -4626,7 +4633,7 @@ app.post('/api/ebooks/:id/publish', authenticateToken, async (req, res) => {
     const resetDate = new Date(user.weekly_ebooks_reset_date);
     const daysSinceReset = Math.floor((now - resetDate) / (24 * 60 * 60 * 1000));
     
-    let weeklyCount = user.weekly_ebooks_count;
+    let weeklyCount = user.weekly_ebooks_count || 0;
     if (daysSinceReset >= 7) {
       weeklyCount = 0;
       await pool.query('UPDATE users SET weekly_ebooks_count = 0, weekly_ebooks_reset_date = $1 WHERE id = $2', [now, userId]);
