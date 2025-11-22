@@ -338,6 +338,7 @@ const initEbookTables = async () => {
     } catch (error) {
       console.log('Ebook tracking columns may already exist:', error.message);
     }
+    
 
     // Create indexes for better performance
     await pool.query(`
@@ -2228,6 +2229,7 @@ app.delete('/api/user', authenticateToken, async (req, res) => {
 });
 
 // Get user statistics
+// Update the /api/user/stats endpoint to include ebook stats
 app.get('/api/user/stats', authenticateToken, async (req, res) => {
   try {
     // Get user's articles
@@ -2242,15 +2244,35 @@ app.get('/api/user/stats', authenticateToken, async (req, res) => {
     const publishedArticles = articles.filter(article => article.published).length;
     const draftArticles = articles.filter(article => !article.published).length;
     
-    // Calculate total views
-    const totalViews = articles.reduce((sum, article) => sum + (article.views || 0), 0);
+    // Calculate total article views
+    const totalArticleViews = articles.reduce((sum, article) => sum + (article.views || 0), 0);
+    
+    // Get user's ebooks
+    const ebooksResult = await pool.query(
+      `SELECT id, published, views, created_at, updated_at
+       FROM ebooks 
+       WHERE user_id = $1`,
+      [req.user.userId]
+    );
+    
+    const ebooks = ebooksResult.rows;
+    const publishedEbooks = ebooks.filter(ebook => ebook.published).length;
+    const draftEbooks = ebooks.filter(ebook => !ebook.published).length;
+    
+    // Calculate total ebook views
+    const totalEbookViews = ebooks.reduce((sum, ebook) => sum + (ebook.views || 0), 0);
     
     res.json({
       stats: {
         totalArticles: articles.length,
         publishedArticles,
         draftArticles,
-        views: totalViews
+        articleViews: totalArticleViews,
+        totalEbooks: ebooks.length,
+        publishedEbooks,
+        draftEbooks,
+        ebookViews: totalEbookViews,
+        totalViews: totalArticleViews + totalEbookViews
       }
     });
   } catch (error) {
@@ -3527,25 +3549,34 @@ app.get('/api/users/:display_name', async (req, res) => {
     const user = userResult.rows[0];
     
     // Get user's published articles
-    const articlesResult = await pool.query(
-      `SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views,
-              ec.certified, a.is_debate_winner,
-              COALESCE(
-                ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
-                ARRAY[]::VARCHAR[]
-              ) as topics
-       FROM articles a
-       LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
-       LEFT JOIN article_topics at ON a.id = at.article_id
-       LEFT JOIN topics t ON at.topic_id = t.id
-       WHERE a.user_id = $1 AND a.published = true
-       GROUP BY a.id, ec.certified
-       ORDER BY a.created_at DESC`,
-      [user.id]
-    );
-    
-    const totalViews = articlesResult.rows.reduce((sum, article) => sum + (article.views || 0), 0);
-    const totalArticles = articlesResult.rows.length;
+const articlesResult = await pool.query(
+  `SELECT a.id, a.title, a.content, a.created_at, a.updated_at, a.views,
+          ec.certified, a.is_debate_winner,
+          COALESCE(
+            ARRAY_AGG(t.name ORDER BY t.name) FILTER (WHERE t.name IS NOT NULL),
+            ARRAY[]::VARCHAR[]
+          ) as topics
+   FROM articles a
+   LEFT JOIN editorial_certifications ec ON a.id = ec.article_id
+   LEFT JOIN article_topics at ON a.id = at.article_id
+   LEFT JOIN topics t ON at.topic_id = t.id
+   WHERE a.user_id = $1 AND a.published = true
+   GROUP BY a.id, ec.certified
+   ORDER BY a.created_at DESC`,
+  [user.id]
+);
+
+// Add this after the articles query:
+const ebooksResult = await pool.query(
+  `SELECT e.id, e.title, e.subtitle, e.description, e.views, e.created_at, e.published_at
+   FROM ebooks e
+   WHERE e.user_id = $1 AND e.published = true
+   ORDER BY e.published_at DESC`,
+  [user.id]
+);
+
+const totalArticleViews = articlesResult.rows.reduce((sum, article) => sum + (article.views || 0), 0);
+const totalEbookViews = ebooksResult.rows.reduce((sum, ebook) => sum + (ebook.views || 0), 0);
     
     // Check authentication (if user is logged in)
     let isFollowing = false;
@@ -3597,14 +3628,18 @@ app.get('/api/users/:display_name', async (req, res) => {
       userResponse.ideology_updated_at = user.ideology_updated_at;
     }
     
-    res.json({
-      user: userResponse,
-      articles: articlesResult.rows,
-      stats: {
-        totalArticles,
-        totalViews
-      }
-    });
+res.json({
+  user: userResponse,
+  articles: articlesResult.rows,
+  ebooks: ebooksResult.rows, // Add ebooks to the response
+  stats: {
+    totalArticles: articlesResult.rows.length,
+    articleViews: totalArticleViews,
+    totalEbooks: ebooksResult.rows.length,
+    ebookViews: totalEbookViews,
+    totalViews: totalArticleViews + totalEbookViews
+  }
+});
   } catch (error) {
     console.error('Get public user profile error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -4553,6 +4588,21 @@ app.post('/api/ebooks/:id/publish', authenticateToken, async (req, res) => {
     if (tags && tags.length > 5) {
       return res.status(400).json({ error: 'Maximum 5 tags allowed' });
     }
+
+    const ebookCountResult = await pool.query(
+  'SELECT COUNT(*) as count FROM ebooks WHERE user_id = $1 AND published = true',
+  [userId]
+);
+
+const ebookCount = parseInt(ebookCountResult.rows[0].count);
+
+// Award points for publishing
+await awardPoints(userId, 'ebook_published', 50, parseInt(id), 'ebook');
+
+// Award bonus points for first ebook
+if (ebookCount === 0) {
+  await awardPoints(userId, 'first_ebook', 20, parseInt(id), 'ebook');
+}
     
     // Publish
     await pool.query(`
