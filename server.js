@@ -4409,6 +4409,7 @@ app.get('/api/ebooks/:id', async (req, res) => {
 });
 
 // Create new ebook (authenticated)
+// Create new ebook (authenticated)
 app.post('/api/ebooks', authenticateToken, async (req, res) => {
   try {
     const { title, subtitle, description, language, cover_color } = req.body;
@@ -4423,10 +4424,10 @@ app.post('/api/ebooks', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Title must be less than 255 characters' });
     }
     
-    // Create ebook
+    // Create ebook - FIXED: Removed the extra parameter
     const result = await pool.query(`
       INSERT INTO ebooks (user_id, title, subtitle, description, language, cover_color)
-      VALUES ($1, $2, $3, $4, $5)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING *
     `, [userId, title.trim(), subtitle?.trim() || null, description?.trim() || null, language || 'en', cover_color || '#667eea']);
     
