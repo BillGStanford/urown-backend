@@ -579,6 +579,7 @@ const initDatabase = async () => {
     // EBOOKS TABLES
 
     const initEbookTables = async () => {
+    await initEbookTables();
   try {
     // Create ebooks table
    await pool.query(`
