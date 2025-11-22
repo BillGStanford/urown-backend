@@ -169,6 +169,18 @@ const authLimiter = rateLimit({
   skip: (req) => !req.user,
 });
 
+// Helper function to get or create anonymous ID for RedFlagged posts
+const getRedFlaggedAnonymousId = (req) => {
+  const sessionKey = 'redflagged_anonymous_id';
+  
+  // Initialize anonymous ID if not exists
+  if (!req.session[sessionKey]) {
+    req.session[sessionKey] = `anon_${Date.now()}_${Math.random()}`;
+  }
+  
+  return req.session[sessionKey];
+};
+
 // Apply general limiter to all routes
 app.use('/api', generalLimiter);
 
@@ -4110,7 +4122,7 @@ app.post('/api/redflagged', async (req, res) => {
       });
     }
     
-    // For anonymous posts, validate username
+    // Replace the anonymous username handling with:
     let finalUsername = null;
     if (is_anonymous || !isAuthenticated) {
       if (!anonymous_username?.trim()) {
