@@ -169,135 +169,606 @@ const authLimiter = rateLimit({
   skip: (req) => !req.user,
 });
 
-// Helper function to get or create anonymous ID for RedFlagged posts
-const getRedFlaggedAnonymousId = (req) => {
-  const sessionKey = 'redflagged_anonymous_id';
-  
-  // Initialize anonymous ID if not exists
-  if (!req.session[sessionKey]) {
-    req.session[sessionKey] = `anon_${Date.now()}_${Math.random()}`;
-  }
-  
-  return req.session[sessionKey];
-};
-
 // Apply general limiter to all routes
 app.use('/api', generalLimiter);
 
 // Apply more lenient limiter to authenticated routes
 app.use('/api/user', authLimiter);
 
-// ============================================
-// EBOOKS HELPER FUNCTIONS
-// ============================================
-
-const initEbooksTables = async () => {
+// Database initialization
+const initDatabase = async () => {
   try {
-    // Create ebooks table
+    // Check if the full_name column needs to be modified
+    try {
+      // First check if the column exists and its constraints
+      const columnCheck = await pool.query(`
+        SELECT column_name, is_nullable 
+        FROM information_schema.columns 
+        WHERE table_name = 'users' AND column_name = 'full_name'
+      `);
+      
+      if (columnCheck.rows.length > 0 && columnCheck.rows[0].is_nullable === 'NO') {
+        // If the column exists but doesn't allow NULL, alter it
+        await pool.query(`
+          ALTER TABLE users ALTER COLUMN full_name DROP NOT NULL
+        `);
+        console.log('Modified full_name column to allow NULL values');
+      }
+    } catch (alterError) {
+      console.log('Could not alter full_name column:', alterError.message);
+    }
+    
+    // Create users table first (no dependencies)
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS ebooks (
+      CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        title VARCHAR(255) NOT NULL,
-        subtitle VARCHAR(255),
-        description TEXT,
-        cover_color VARCHAR(7) DEFAULT '#667eea',
-        language VARCHAR(10) DEFAULT 'en',
-        published BOOLEAN DEFAULT FALSE,
-        published_at TIMESTAMP,
-        views INTEGER DEFAULT 0,
-        length VARCHAR(10) DEFAULT 'short',
-        isbn VARCHAR(20),
-        license VARCHAR(50) DEFAULT 'all-rights-reserved',
-        tags TEXT[],
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    // Create ebook_chapters table
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ebook_chapters (
-        id SERIAL PRIMARY KEY,
-        ebook_id INTEGER REFERENCES ebooks(id) ON DELETE CASCADE,
-        title VARCHAR(255) NOT NULL,
-        content TEXT NOT NULL,
-        word_count INTEGER DEFAULT 0,
-        order_index INTEGER NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    // Create ebook_reading_progress table
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ebook_reading_progress (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        ebook_id INTEGER REFERENCES ebooks(id) ON DELETE CASCADE,
-        current_chapter_id INTEGER REFERENCES ebook_chapters(id) ON DELETE CASCADE,
-        progress_percent INTEGER DEFAULT 0,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        phone VARCHAR(20),
+        full_name VARCHAR(255),
+        display_name VARCHAR(100) NOT NULL UNIQUE,
+        discord_username VARCHAR(100),
+        date_of_birth DATE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        tier VARCHAR(20) DEFAULT 'Silver',
+        weekly_articles_count INTEGER DEFAULT 0,
+        weekly_reset_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        terms_agreed BOOLEAN DEFAULT FALSE,
+        role VARCHAR(20) DEFAULT 'user',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_id, ebook_id)
+        display_name_updated_at TIMESTAMP,
+        email_updated_at TIMESTAMP,
+        phone_updated_at TIMESTAMP,
+        password_updated_at TIMESTAMP,
+        discord_username_updated_at TIMESTAMP,
+        account_status VARCHAR(20) DEFAULT 'active',
+        soft_deleted_at TIMESTAMP,
+        hard_deleted_at TIMESTAMP,
+        deletion_reason TEXT,
+        followers INTEGER DEFAULT 0,
+        CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
       )
     `);
 
-    // Add weekly_ebooks_count column to users table if it doesn't exist
+    // Add migration to add column if it doesn't exist
     try {
       await pool.query(`
         ALTER TABLE users 
-        ADD COLUMN IF NOT EXISTS weekly_ebooks_count INTEGER DEFAULT 0
+        ADD COLUMN IF NOT EXISTS discord_username VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS discord_username_updated_at TIMESTAMP
       `);
-      console.log('Added weekly_ebooks_count column to users table');
+      console.log('Discord username columns added to users table');
     } catch (error) {
-      console.log('weekly_ebooks_count column may already exist:', error.message);
+      console.log('Discord username columns may already exist:', error.message);
     }
 
-    // Create indexes for better performance
+    // Create index for faster lookups (optional but recommended)
+    try {
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_users_discord_username ON users(discord_username)
+      `);
+      console.log('Discord username index created');
+    } catch (error) {
+      console.log('Discord username index may already exist:', error.message);
+    }
+
+    // Add ideology columns if they don't exist
+    try {
+      await pool.query(`
+        ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS ideology VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS ideology_details JSONB,
+        ADD COLUMN IF NOT EXISTS ideology_public BOOLEAN DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS ideology_updated_at TIMESTAMP
+      `);
+      console.log('Ideology columns added to users table');
+    } catch (error) {
+      console.log('Ideology columns may already exist:', error.message);
+    }
+
+    // Add UROWN Score columns to users table
     await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_ebooks_user_id ON ebooks(user_id);
-      CREATE INDEX IF NOT EXISTS idx_ebooks_published ON ebooks(published);
-      CREATE INDEX IF NOT EXISTS idx_ebooks_created_at ON ebooks(created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_ebook_chapters_ebook_id ON ebook_chapters(ebook_id);
-      CREATE INDEX IF NOT EXISTS idx_ebook_chapters_order ON ebook_chapters(ebook_id, order_index);
-      CREATE INDEX IF NOT EXISTS idx_ebook_reading_progress_user_ebook ON ebook_reading_progress(user_id, ebook_id);
+      ALTER TABLE users 
+      ADD COLUMN IF NOT EXISTS urown_score INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_score_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     `);
 
-    console.log('Ebooks tables initialized successfully');
+    // Create index for faster leaderboard queries
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_urown_score ON users(urown_score DESC)
+    `);
+
+    // Create score_activities table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS score_activities (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        activity_type VARCHAR(50) NOT NULL,
+        points_earned INTEGER NOT NULL,
+        reference_id INTEGER,
+        reference_type VARCHAR(50),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_score_activities_user_id ON score_activities(user_id);
+      CREATE INDEX IF NOT EXISTS idx_score_activities_created_at ON score_activities(created_at DESC);
+    `);
+
+    // Create leaderboard_history table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS leaderboard_history (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        display_name VARCHAR(100) NOT NULL,
+        entered_top_15 BOOLEAN DEFAULT TRUE,
+        rank_position INTEGER NOT NULL,
+        urown_score INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_leaderboard_history_created_at ON leaderboard_history(created_at DESC)
+    `);
+
+    // Create score update function
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION update_user_score(
+        p_user_id INTEGER,
+        p_activity_type VARCHAR(50),
+        p_points INTEGER,
+        p_reference_id INTEGER DEFAULT NULL,
+        p_reference_type VARCHAR(50) DEFAULT NULL
+      ) RETURNS INTEGER AS $$       DECLARE
+        v_new_score INTEGER;
+        v_old_rank INTEGER;
+        v_new_rank INTEGER;
+        v_display_name VARCHAR(100);
+      BEGIN
+        SELECT urown_score, display_name INTO v_new_score, v_display_name
+        FROM users WHERE id = p_user_id;
+        
+        v_new_score := COALESCE(v_new_score, 0) + p_points;
+        
+        SELECT rank_num INTO v_old_rank
+        FROM (
+          SELECT id, ROW_NUMBER() OVER (ORDER BY urown_score DESC, created_at ASC) as rank_num
+          FROM users
+          WHERE account_status = 'active' AND urown_score > 0
+        ) ranked
+        WHERE id = p_user_id AND rank_num <= 15;
+        
+        UPDATE users 
+        SET urown_score = v_new_score,
+            last_score_update = CURRENT_TIMESTAMP
+        WHERE id = p_user_id;
+        
+        INSERT INTO score_activities (user_id, activity_type, points_earned, reference_id, reference_type)
+        VALUES (p_user_id, p_activity_type, p_points, p_reference_id, p_reference_type);
+        
+        SELECT rank_num INTO v_new_rank
+        FROM (
+          SELECT id, ROW_NUMBER() OVER (ORDER BY urown_score DESC, created_at ASC) as rank_num
+          FROM users
+          WHERE account_status = 'active' AND urown_score > 0
+        ) ranked
+        WHERE id = p_user_id AND rank_num <= 15;
+        
+        IF v_old_rank IS NULL AND v_new_rank IS NOT NULL THEN
+          INSERT INTO leaderboard_history (user_id, display_name, entered_top_15, rank_position, urown_score)
+          VALUES (p_user_id, v_display_name, TRUE, v_new_rank, v_new_score);
+        END IF;
+        
+        RETURN v_new_score;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    console.log('UROWN Score system initialized successfully');
+
+    // Create followers table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS followers (
+        id SERIAL PRIMARY KEY,
+        follower_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        following_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(follower_id, following_id)
+      )
+    `);
+
+    // Create topics table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS topics (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(50) UNIQUE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create article_topics junction table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS article_topics (
+        article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
+        topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+        PRIMARY KEY (article_id, topic_id)
+      )
+    `);
+
+    // Create debate_topics table (referenced by articles)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS debate_topics (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        description TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP NOT NULL,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+      )
+    `);
+
+    // Create articles table (references debate_topics)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS articles (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        title VARCHAR(255) NOT NULL,
+        content TEXT NOT NULL,
+        published BOOLEAN DEFAULT FALSE,
+        featured BOOLEAN DEFAULT FALSE,
+        views INTEGER DEFAULT 0,
+        parent_article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
+        debate_topic_id INTEGER REFERENCES debate_topics(id) ON DELETE CASCADE,
+        is_debate_winner BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Add anonymous_username column to articles table
+    await pool.query(`
+      ALTER TABLE articles 
+      ADD COLUMN IF NOT EXISTS anonymous_username VARCHAR(100)
+    `);
+    console.log('Added anonymous_username column to articles table');
+
+    // Create session table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS session (
+        sid varchar NOT NULL,
+        sess json NOT NULL,
+        expire timestamp(6) NOT NULL,
+        PRIMARY KEY (sid)
+      )
+    `);
+
+    // Create editorial board certifications table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS editorial_certifications (
+        id SERIAL PRIMARY KEY,
+        article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
+        admin_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        certified BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(article_id)
+      )
+    `);
+    
+    // Create audit log table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id SERIAL PRIMARY KEY,
+        admin_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        action VARCHAR(50) NOT NULL,
+        target_type VARCHAR(50) NOT NULL,
+        target_id INTEGER NOT NULL,
+        details TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create contact messages table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS contact_messages (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255),
+        phone VARCHAR(20),
+        category VARCHAR(50) NOT NULL,
+        content TEXT NOT NULL,
+        status VARCHAR(20) DEFAULT 'waiting' CHECK (status IN ('waiting', 'in_progress', 'resolved')),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT email_or_phone_required CHECK (email IS NOT NULL OR phone IS NOT NULL)
+      )
+    `);
+
+    // Create reported articles table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS reported_articles (
+        id SERIAL PRIMARY KEY,
+        article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        reason TEXT NOT NULL,
+        status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'reviewed', 'resolved', 'dismissed')),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create user_warnings table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_warnings (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reason TEXT NOT NULL,
+        admin_id INTEGER NOT NULL REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create user_bans table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_bans (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        ban_start TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        ban_end TIMESTAMP NOT NULL,
+        reason TEXT NOT NULL,
+        admin_id INTEGER NOT NULL REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create debate_winners table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS debate_winners (
+        id SERIAL PRIMARY KEY,
+        debate_topic_id INTEGER REFERENCES debate_topics(id) ON DELETE CASCADE,
+        article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
+        selected_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        selected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(debate_topic_id, article_id)
+      )
+    `);
+
+    // Create notifications table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(50) NOT NULL,
+        message TEXT NOT NULL,
+        link VARCHAR(500),
+        read BOOLEAN DEFAULT FALSE,
+        deletion_starts_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create index for faster queries
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
+      CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
+    `);
+
+    // Create bookmarks table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bookmarks (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        article_id INTEGER REFERENCES articles(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, article_id)
+      )
+    `);
+
+    // Create indexes for faster queries
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_bookmarks_user_id ON bookmarks(user_id);
+      CREATE INDEX IF NOT EXISTS idx_bookmarks_article_id ON bookmarks(article_id);
+      CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at ON bookmarks(created_at DESC);
+    `);
+
+    console.log('Bookmarks table initialized successfully');
+
+    // ============================================
+    // REDFLAGGED TABLES
+    // ============================================
+    
+    // Create redflagged_posts table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS redflagged_posts (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        company_name VARCHAR(255) NOT NULL,
+        position VARCHAR(255),
+        experience_type VARCHAR(100) NOT NULL,
+        story TEXT NOT NULL,
+        rating_fairness INTEGER NOT NULL CHECK (rating_fairness BETWEEN 1 AND 5),
+        rating_pay INTEGER NOT NULL CHECK (rating_pay BETWEEN 1 AND 5),
+        rating_culture INTEGER NOT NULL CHECK (rating_culture BETWEEN 1 AND 5),
+        rating_management INTEGER NOT NULL CHECK (rating_management BETWEEN 1 AND 5),
+        overall_rating INTEGER GENERATED ALWAYS AS (
+          (rating_fairness + rating_pay + rating_culture + rating_management) / 4
+        ) STORED,
+        anonymous_username VARCHAR(100),
+        is_anonymous BOOLEAN DEFAULT TRUE,
+        published BOOLEAN DEFAULT TRUE,
+        flagged BOOLEAN DEFAULT FALSE,
+        flagged_reason TEXT,
+        views INTEGER DEFAULT 0,
+        reaction_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Create redflagged_reactions table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS redflagged_reactions (
+        id SERIAL PRIMARY KEY,
+        post_id INTEGER REFERENCES redflagged_posts(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        anonymous_identifier VARCHAR(255),
+        reaction_type VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CHECK (user_id IS NOT NULL OR anonymous_identifier IS NOT NULL)
+      )
+    `);
+    
+    // Create redflagged_comments table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS redflagged_comments (
+        id SERIAL PRIMARY KEY,
+        post_id INTEGER REFERENCES redflagged_posts(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        commenter_name VARCHAR(255) NOT NULL,
+        comment TEXT NOT NULL,
+        is_company_response BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create indexes for RedFlagged tables
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_redflagged_posts_company ON redflagged_posts(company_name);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_posts_published ON redflagged_posts(published);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_posts_flagged ON redflagged_posts(flagged);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_posts_created_at ON redflagged_posts(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_reactions_post_id ON redflagged_reactions(post_id);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_reactions_user_id ON redflagged_reactions(user_id);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_comments_post_id ON redflagged_comments(post_id);
+      CREATE INDEX IF NOT EXISTS idx_redflagged_comments_created_at ON redflagged_comments(created_at DESC);
+    `);
+
+    console.log('RedFlagged tables initialized successfully');
+
+    // Create trigger function to create notification on new follower
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION notify_new_follower()
+      RETURNS TRIGGER AS $$       BEGIN
+        INSERT INTO notifications (user_id, type, message, link)
+        VALUES (
+          NEW.following_id,
+          'new_follower',
+          (SELECT display_name FROM users WHERE id = NEW.follower_id) || ' started following you!',
+          '/user/' || (SELECT display_name FROM users WHERE id = NEW.follower_id)
+        );
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    await pool.query(`
+      DROP TRIGGER IF EXISTS trigger_new_follower ON followers;
+      CREATE TRIGGER trigger_new_follower
+      AFTER INSERT ON followers
+      FOR EACH ROW
+      EXECUTE FUNCTION notify_new_follower();
+    `);
+
+    // Create trigger function to create notification on counter argument
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION notify_counter_argument()
+      RETURNS TRIGGER AS $$       DECLARE
+        parent_user_id INTEGER;
+        parent_title TEXT;
+      BEGIN
+        IF NEW.parent_article_id IS NOT NULL THEN
+          SELECT user_id, title INTO parent_user_id, parent_title
+          FROM articles WHERE id = NEW.parent_article_id;
+          
+          IF parent_user_id IS NOT NULL AND parent_user_id != NEW.user_id THEN
+            INSERT INTO notifications (user_id, type, message, link)
+            VALUES (
+              parent_user_id,
+              'counter_argument',
+              (SELECT display_name FROM users WHERE id = NEW.user_id) || 
+              ' wrote a counter-argument to your article "' || 
+              SUBSTRING(parent_title, 1, 50) || 
+              CASE WHEN LENGTH(parent_title) > 50 THEN '..."' ELSE '"' END,
+              '/article/' || NEW.id
+            );
+          END IF;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    await pool.query(`
+      DROP TRIGGER IF EXISTS trigger_counter_argument ON articles;
+      CREATE TRIGGER trigger_counter_argument
+      AFTER INSERT ON articles
+      FOR EACH ROW
+      EXECUTE FUNCTION notify_counter_argument();
+    `);
+
+    // Create trigger function to notify followers of new posts
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION notify_followers_new_post()
+      RETURNS TRIGGER AS $$       BEGIN
+        IF NEW.published = TRUE AND NEW.parent_article_id IS NULL AND NEW.debate_topic_id IS NULL THEN
+          INSERT INTO notifications (user_id, type, message, link)
+          SELECT 
+            f.follower_id,
+            'following_post',
+            (SELECT display_name FROM users WHERE id = NEW.user_id) || 
+            ' published a new article: "' || 
+            SUBSTRING(NEW.title, 1, 50) || 
+            CASE WHEN LENGTH(NEW.title) > 50 THEN '..."' ELSE '"' END,
+            '/article/' || NEW.id
+          FROM followers f
+          WHERE f.following_id = NEW.user_id;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    await pool.query(`
+      DROP TRIGGER IF EXISTS trigger_followers_new_post ON articles;
+      CREATE TRIGGER trigger_followers_new_post
+      AFTER INSERT ON articles
+      FOR EACH ROW
+      EXECUTE FUNCTION notify_followers_new_post();
+    `);
+
+    // Insert default topics if they don't exist
+    const defaultTopics = [
+      'Politics', 'Business', 'Finance', 'Sports', 'Food', 'Travel',
+      'Technology', 'Health', 'Entertainment', 'Science', 'Environment'
+    ];
+
+    for (const topic of defaultTopics) {
+      await pool.query(`
+        INSERT INTO topics (name) 
+        VALUES ($1) 
+        ON CONFLICT (name) DO NOTHING
+      `, [topic]);
+    }
+
+    // Set super-admin for the specified user
+    try {
+      await pool.query(`
+        UPDATE users 
+        SET role = 'super-admin' 
+        WHERE id = 1 AND email = 'natolilemessa089@gmail.com'
+      `);
+      console.log('Super-admin assigned to user ID 1');
+    } catch (updateError) {
+      console.log('Could not update super-admin:', updateError.message);
+    }
+
+    console.log('Database tables initialized successfully');
   } catch (error) {
-    console.error('Error initializing ebooks tables:', error);
+    console.error('Error initializing database:', error);
     throw error;
   }
-};
-
-const resetWeeklyEbookCount = async () => {
-  try {
-    await pool.query(
-      'UPDATE users SET weekly_ebooks_count = 0'
-    );
-    console.log('Weekly ebook count reset successfully');
-  } catch (error) {
-    console.error('Error resetting weekly ebook count:', error);
-  }
-};
-
-const scheduleWeeklyReset = () => {
-  const now = new Date();
-  const daysUntilSunday = (7 - now.getDay()) % 7 || 7;
-  const nextSunday = new Date(now);
-  nextSunday.setDate(now.getDate() + daysUntilSunday);
-  nextSunday.setHours(0, 0, 0, 0);
-  
-  const msUntilSunday = nextSunday - now;
-  
-  setTimeout(() => {
-    resetWeeklyEbookCount();
-    // Schedule the next reset
-    setInterval(resetWeeklyEbookCount, 7 * 24 * 60 * 60 * 1000); // Every week
-  }, msUntilSunday);
-  
-  console.log(`Weekly ebook count reset scheduled for ${nextSunday.toISOString()}`);
 };
 
 // Helper function to award points
@@ -476,7 +947,7 @@ const validateSignup = [
   body('date_of_birth').isISO8601().toDate().withMessage('Please enter a valid date of birth'),
   body('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters')
     .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/).withMessage('Password must contain uppercase, lowercase, and number'),
-  body('terms_agreed').equals('true').withMessage('You must agree to terms of service'),
+  body('terms_agreed').equals('true').withMessage('You must agree to the terms of service'),
   (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -591,7 +1062,7 @@ app.get('/api/admin/contacts', authenticateSuperAdmin, async (req, res) => {
           query += ' AND';
           query += ` category = $${params.length + 1}`;
         } else {
-          query += ` category = $1`;
+          query += ' category = $1';
         }
         params.push(category);
       }
@@ -848,7 +1319,7 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
       return res.status(400).json({ error: 'Cannot warn a deleted account' });
     }
 
-    // Add warning
+    // Add the warning
     await pool.query(
       `INSERT INTO user_warnings (user_id, reason, admin_id)
        VALUES ($1, $2, $3)`,
@@ -911,7 +1382,7 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
       return res.status(404).json({ error: 'Warning not found' });
     }
 
-    // Delete warning
+    // Delete the warning
     await pool.query(
       'DELETE FROM user_warnings WHERE id = $1',
       [warningId]
@@ -1010,7 +1481,7 @@ app.post('/api/admin/users/:userId/undo-delete', authenticateAdmin, async (req, 
 
     const user = userResult.rows[0];
 
-    // Reactivate account
+    // Reactivate the account
     await pool.query(
       `UPDATE users 
        SET account_status = 'active', 
@@ -1085,7 +1556,7 @@ app.post('/api/admin/hard-delete-accounts', authenticateAdmin, async (req, res) 
     let deletedCount = 0;
     
     for (const user of usersToDelete.rows) {
-      // Hard delete user (articles will remain with user_id set to NULL)
+      // Hard delete the user (articles will remain with user_id set to NULL)
       await pool.query(
         'DELETE FROM users WHERE id = $1',
         [user.id]
@@ -1122,7 +1593,7 @@ app.post('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
 
     // Validate banEnd (should be a future date)
     if (!banEnd || new Date(banEnd) <= new Date()) {
-      return res.status(400).json({ error: 'Ban end time must be in future' });
+      return res.status(400).json({ error: 'Ban end time must be in the future' });
     }
 
     if (!reason || !reason.trim()) {
@@ -1149,7 +1620,7 @@ app.post('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
       return res.status(400).json({ error: 'User is already banned' });
     }
 
-    // Create ban
+    // Create the ban
     await pool.query(
       `INSERT INTO user_bans (user_id, ban_end, reason, admin_id)
        VALUES ($1, $2, $3, $4)`,
@@ -1187,7 +1658,7 @@ app.delete('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
       return res.status(404).json({ error: 'User is not currently banned' });
     }
 
-    // Remove ban by setting ban_end to now
+    // Remove the ban by setting ban_end to now
     await pool.query(
       'UPDATE user_bans SET ban_end = CURRENT_TIMESTAMP WHERE user_id = $1',
       [id]
@@ -1265,7 +1736,7 @@ app.post('/api/auth/signup', async (req, res) => {
     
     // Terms validation
     if (terms_agreed !== true) {
-      errors.terms_agreed = 'You must agree to terms of service';
+      errors.terms_agreed = 'You must agree to the terms of service';
     }
     
     // If there are validation errors, return them
@@ -1414,7 +1885,7 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
       }
 
       return res.status(401).json({ 
-        error: `Your account has been banned. Reason: "${ban.reason}." The ban will expire in ${timeLeft}. If you disagree contact us at, nilecommun@gmail.com` 
+        error: `Your account has been banned. Reason: "${ban.reason}". The ban will expire in ${timeLeft}. If you disagree contact us at, nilecommun@gmail.com` 
       });
     }
 
@@ -1460,8 +1931,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
               weekly_articles_count, weekly_reset_date, 
               display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
               discord_username_updated_at, created_at, followers, urown_score,
-              ideology, ideology_details, ideology_public, ideology_updated_at,
-              weekly_ebooks_count
+              ideology, ideology_details, ideology_public, ideology_updated_at
        FROM users 
        WHERE id = $1`,
       [req.user.userId]
@@ -1639,7 +2109,7 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
     // Add user ID to values
     values.push(userId);
 
-    // Update user
+    // Update the user
     const updateQuery = `
       UPDATE users 
       SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP 
@@ -1743,7 +2213,7 @@ app.delete('/api/user', authenticateToken, async (req, res) => {
 
     const user = userResult.rows[0];
 
-    // Soft delete user
+    // Soft delete the user
     await pool.query(
       `UPDATE users 
        SET account_status = 'soft_deleted', 
@@ -1834,7 +2304,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
       }
     }
 
-    // If this is a counter opinion, validate parent article
+    // If this is a counter opinion, validate the parent article
     if (parent_article_id) {
       // Check if parent article exists and is published
       const parentResult = await pool.query(
@@ -1857,7 +2327,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
       }
     }
 
-    // If this is a debate opinion, validate debate topic
+    // If this is a debate opinion, validate the debate topic
     if (debate_topic_id) {
       // Check if debate topic exists and is active
       const topicResult = await pool.query(
@@ -2156,7 +2626,7 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
     const { title, content, published, featured, topicIds = [] } = req.body;
     const userId = req.user.userId;
 
-    // Check if user owns article
+    // Check if user owns the article
     const ownerCheck = await pool.query(
       'SELECT user_id, published as current_published, parent_article_id, debate_topic_id FROM articles WHERE id = $1',
       [id]
@@ -2258,7 +2728,7 @@ app.delete('/api/articles/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const userId = req.user.userId;
 
-    // Check if user owns article
+    // Check if user owns the article
     const ownerCheck = await pool.query(
       'SELECT user_id FROM articles WHERE id = $1',
       [id]
@@ -2490,7 +2960,7 @@ app.delete('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
     
     const user = userResult.rows[0];
     
-    // Soft delete user
+    // Soft delete the user
     await pool.query(
       `UPDATE users 
        SET account_status = 'soft_deleted', 
@@ -2681,7 +3151,7 @@ app.get('/api/debate-topics', async (req, res) => {
       )
     `);
     
-    // Only delete debate topics themselves, not articles
+    // Only delete the debate topics themselves, not the articles
     // This way, winning articles and certified articles remain visible
     await pool.query(`
       DELETE FROM debate_topics 
@@ -2869,7 +3339,7 @@ app.post('/api/debate-topics/:id/opinions', async (req, res) => {
       }
     }
     
-    // Create opinion as an article
+    // Create the opinion as an article
     const result = await pool.query(
       `INSERT INTO articles (user_id, title, content, published, debate_topic_id, anonymous_username)
        VALUES ($1, $2, $3, true, $4, $5)
@@ -2907,7 +3377,7 @@ app.post('/api/debate-topics', authenticateEditorialBoard, async (req, res) => {
     const expiresAt = new Date();
     expiresAt.setHours(expiresAt.getHours() + 24);
     
-    // Create debate topic
+    // Create the debate topic
     const result = await pool.query(
       `INSERT INTO debate_topics (title, description, expires_at, created_by)
        VALUES ($1, $2, $3, $4)
@@ -2941,7 +3411,7 @@ app.post('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoard
       return res.status(404).json({ error: 'Debate topic not found or expired' });
     }
 
-    // Check if article exists and belongs to debate topic
+    // Check if article exists and belongs to the debate topic
     const articleCheck = await pool.query(
       'SELECT id FROM articles WHERE id = $1 AND debate_topic_id = $2',
       [articleId, id]
@@ -2961,14 +3431,14 @@ app.post('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoard
       return res.status(400).json({ error: 'Article is already marked as a winner' });
     }
 
-    // Mark article as a winner
+    // Mark the article as a winner
     await pool.query(
       `INSERT INTO debate_winners (debate_topic_id, article_id, selected_by)
        VALUES ($1, $2, $3)`,
       [id, articleId, userId]
     );
 
-    // Update article to mark it as a debate winner
+    // Update the article to mark it as a debate winner
     await pool.query(
       'UPDATE articles SET is_debate_winner = TRUE WHERE id = $1',
       [articleId]
@@ -3028,13 +3498,13 @@ app.delete('/api/debate-topics/:id/winners/:articleId', authenticateEditorialBoa
       return res.status(404).json({ error: 'Article is not marked as a winner for this debate topic' });
     }
 
-    // Remove winner status
+    // Remove the winner status
     await pool.query(
       'DELETE FROM debate_winners WHERE debate_topic_id = $1 AND article_id = $2',
       [id, articleId]
     );
 
-    // Update article to mark it as not a debate winner
+    // Update the article to mark it as not a debate winner
     await pool.query(
       'UPDATE articles SET is_debate_winner = FALSE WHERE id = $1',
       [articleId]
@@ -3155,6 +3625,7 @@ app.get('/api/users/:display_name', async (req, res) => {
 });
 
 // Follow a user
+// Follow a user
 app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
   const client = await pool.connect();
   
@@ -3165,7 +3636,7 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
     // Start transaction
     await client.query('BEGIN');
     
-// Check if user exists
+    // Check if user exists
     const userResult = await client.query(
       'SELECT id, followers FROM users WHERE id = $1 AND account_status = $2',
       [id, 'active']
@@ -3199,7 +3670,7 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
       [followerId, id]
     );
     
-    // Update followers count - using current value from database
+    // Update followers count - using the current value from the database
     const currentFollowers = userResult.rows[0].followers || 0;
     await client.query(
       'UPDATE users SET followers = $1 WHERE id = $2',
@@ -3219,6 +3690,7 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
   }
 });
 
+// Unfollow a user
 // Unfollow a user
 app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -3379,7 +3851,7 @@ app.get('/api/debug/ideology/:userId', authenticateToken, async (req, res) => {
     const { userId } = req.params;
     const requestorId = req.user.userId;
     
-    // Get user's ideology data
+    // Get the user's ideology data
     const userResult = await pool.query(
       `SELECT id, display_name, ideology, ideology_details, ideology_public, ideology_updated_at
        FROM users 
@@ -3393,7 +3865,7 @@ app.get('/api/debug/ideology/:userId', authenticateToken, async (req, res) => {
 
     const user = userResult.rows[0];
     
-    // Check if this is user's own profile
+    // Check if this is the user's own profile
     const isOwnProfile = parseInt(requestorId) === parseInt(userId);
     
     // Determine what should be visible
@@ -3424,8 +3896,7 @@ app.get('/api/debug/ideology/:userId', authenticateToken, async (req, res) => {
         actual: {
           ideology: user.ideology,
           ideology_details: user.ideology_details,
-          ideology_public: user.ideology_public,
-          ideology_updated_at: user.ideology_updated_at
+          ideology_public: user.ideology_public
         },
         visible: {
           ideology: visibleIdeology,
@@ -3455,7 +3926,7 @@ app.post('/api/admin/articles/create', authenticateAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Title must be 255 characters or less' });
     }
 
-    // Find user by username
+    // Find the user by username
     const userResult = await pool.query(
       'SELECT id FROM users WHERE display_name = $1 AND account_status = $2',
       [username, 'active']
@@ -3981,7 +4452,6 @@ app.get('/api/redflagged', async (req, res) => {
     if (maxRating) {
       countQuery += ` AND rf.overall_rating <= $${countIndex}`;
       countParams.push(parseFloat(maxRating));
-      countIndex++;
     }
     
     const countResult = await pool.query(countQuery, countParams);
@@ -4122,7 +4592,7 @@ app.post('/api/redflagged', async (req, res) => {
       });
     }
     
-    // Replace the anonymous username handling with:
+    // For anonymous posts, validate username
     let finalUsername = null;
     if (is_anonymous || !isAuthenticated) {
       if (!anonymous_username?.trim()) {
@@ -4228,20 +4698,14 @@ app.post('/api/redflagged/:id/react', async (req, res) => {
         userId = decoded.userId;
       } catch (err) {
         // Token invalid, use anonymous
+        anonymousId = req.session.id || `anon_${Date.now()}_${Math.random()}`;
       }
-    }
-    
-    // Handle anonymous users
-    if (!userId) {
-      // Use a fixed session key for anonymous ID
-      const sessionKey = 'redflagged_anonymous_id';
-      
-      // Initialize anonymous ID if not exists
-      if (!req.session[sessionKey]) {
-        req.session[sessionKey] = `anon_${Date.now()}_${Math.random()}`;
+    } else {
+      // Generate anonymous identifier from session
+      if (!req.session.anonymousId) {
+        req.session.anonymousId = `anon_${Date.now()}_${Math.random()}`;
       }
-      
-      anonymousId = req.session[sessionKey];
+      anonymousId = req.session.anonymousId;
     }
     
     // Check if already reacted
@@ -4301,14 +4765,10 @@ app.get('/api/redflagged/:id/my-reactions', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         userId = decoded.userId;
       } catch (err) {
-        // Token invalid
+        anonymousId = req.session.anonymousId;
       }
-    }
-    
-    // Handle anonymous users
-    if (!userId) {
-      const sessionKey = 'redflagged_anonymous_id';
-      anonymousId = req.session[sessionKey] || null;
+    } else {
+      anonymousId = req.session.anonymousId;
     }
     
     let result;
@@ -4585,7 +5045,7 @@ app.post('/api/admin/redflagged/topics', authenticateEditorialBoard, async (req,
       [title.trim(), description.trim(), userId, expires_at || null]
     );
     
-    // Log the action
+    // Log action
     await logAdminAction(
       userId,
       'create',
@@ -4638,7 +5098,7 @@ app.put('/api/admin/redflagged/topics/:id', authenticateEditorialBoard, async (r
       [title.trim(), description.trim(), expires_at || null, id]
     );
     
-    // Log the action
+    // Log action
     await logAdminAction(
       req.user.userId,
       'update',
@@ -4684,7 +5144,7 @@ app.put('/api/admin/redflagged/topics/:id/toggle', authenticateEditorialBoard, a
       [active, id]
     );
     
-    // Log the action
+    // Log action
     await logAdminAction(
       req.user.userId,
       active ? 'activate' : 'deactivate',
@@ -4736,7 +5196,7 @@ app.delete('/api/admin/redflagged/topics/:id', authenticateEditorialBoard, async
     // Delete topic
     await pool.query('DELETE FROM redflagged_topics WHERE id = $1', [id]);
     
-    // Log the action
+    // Log action
     await logAdminAction(
       req.user.userId,
       'delete',
@@ -4878,871 +5338,57 @@ app.get('/api/user/rank', authenticateToken, async (req, res) => {
 });
 
 // ============================================
-// EBOOKS API ENDPOINTS
+// MILESTONE BONUS SYSTEM
 // ============================================
 
-// Create a new ebook
-app.post('/api/ebooks', authenticateToken, async (req, res) => {
+// Auto-check for milestones every hour
+setInterval(async () => {
   try {
-    const { title, subtitle, description, language, cover_color } = req.body;
-    const userId = req.user.userId;
-
-    // Validate input
-    if (!title || !title.trim()) {
-      return res.status(400).json({ error: 'Title is required' });
+    // Award points for articles reaching 100 views
+    const viewMilestones = await pool.query(`
+      SELECT a.id, a.user_id, a.views
+      FROM articles a
+      LEFT JOIN score_activities sa ON sa.reference_id = a.id 
+        AND sa.reference_type = 'article' 
+        AND sa.activity_type = 'article_views_100'
+      WHERE a.views >= 100 
+        AND a.published = TRUE
+        AND a.user_id IS NOT NULL
+        AND sa.id IS NULL
+    `);
+    
+    for (const article of viewMilestones.rows) {
+      await awardPoints(article.user_id, 'article_views_100', 5, article.id, 'article');
+    }
+    
+    if (viewMilestones.rows.length > 0) {
+      console.log(`Awarded view milestone bonuses to ${viewMilestones.rows.length} articles`);
     }
 
-    if (title.length > 255) {
-      return res.status(400).json({ error: 'Title must be less than 255 characters' });
+    // Award points for newly certified articles
+    const certifications = await pool.query(`
+      SELECT ec.article_id, a.user_id
+      FROM editorial_certifications ec
+      JOIN articles a ON a.id = ec.article_id
+      LEFT JOIN score_activities sa ON sa.reference_id = ec.article_id 
+        AND sa.reference_type = 'article' 
+        AND sa.activity_type = 'article_certified'
+      WHERE ec.certified = TRUE
+        AND a.user_id IS NOT NULL
+        AND sa.id IS NULL
+    `);
+    
+    for (const cert of certifications.rows) {
+      await awardPoints(cert.user_id, 'article_certified', 20, cert.article_id, 'article');
     }
 
-    if (subtitle && subtitle.length > 255) {
-      return res.status(400).json({ error: 'Subtitle must be less than 255 characters' });
+    if (certifications.rows.length > 0) {
+      console.log(`Awarded certification bonuses to ${certifications.rows.length} articles`);
     }
-
-    if (description && description.length > 5000) {
-      return res.status(400).json({ error: 'Description must be less than 5000 characters' });
-    }
-
-    // Check weekly limit
-    const userResult = await pool.query(
-      'SELECT weekly_ebooks_count FROM users WHERE id = $1',
-      [userId]
-    );
-
-    const weeklyLimit = 2; // Default limit
-    if (userResult.rows[0].weekly_ebooks_count >= weeklyLimit) {
-      return res.status(400).json({ error: 'Weekly ebook limit reached' });
-    }
-
-    // Create ebook
-    const result = await pool.query(
-      `INSERT INTO ebooks (user_id, title, subtitle, description, language, cover_color)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [userId, title.trim(), subtitle ? subtitle.trim() : null, description ? description.trim() : null, language || 'en', cover_color || '#667eea']
-    );
-
-    res.status(201).json({
-      message: 'Ebook created successfully',
-      ebook: result.rows[0]
-    });
-
   } catch (error) {
-    console.error('Create ebook error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Auto milestone check error:', error);
   }
-});
-
-// Get all published ebooks (for browsing)
-app.get('/api/ebooks', async (req, res) => {
-  try {
-    const { length, tag, sort, search, limit = 20, offset = 0 } = req.query;
-    
-    let query = `
-      SELECT 
-        e.*,
-        u.display_name as author_name,
-        u.tier as author_tier,
-        COUNT(ec.id) as chapter_count
-      FROM ebooks e
-      JOIN users u ON e.user_id = u.id
-      LEFT JOIN ebook_chapters ec ON e.id = ec.ebook_id
-      WHERE e.published = true
-    `;
-    
-    const params = [];
-    let paramIndex = 1;
-    
-    // Add filters
-    if (length && length !== 'all') {
-      query += ` AND e.length = $${paramIndex}`;
-      params.push(length);
-      paramIndex++;
-    }
-    
-    if (tag && tag !== 'all') {
-      query += ` AND $${paramIndex} = ANY(e.tags)`;
-      params.push(tag);
-      paramIndex++;
-    }
-    
-    if (search) {
-      query += ` AND (LOWER(e.title) LIKE LOWER($${paramIndex}) OR LOWER(e.description) LIKE LOWER($${paramIndex}))`;
-      params.push(`%${search}%`);
-      paramIndex++;
-    }
-    
-    // Group by and order
-    query += ` GROUP BY e.id, u.display_name, u.tier`;
-    
-    // Add sorting
-    switch (sort) {
-      case 'popular':
-        query += ` ORDER BY e.views DESC`;
-        break;
-      case 'views':
-        query += ` ORDER BY e.views DESC`;
-        break;
-      default: // recent
-        query += ` ORDER BY e.published_at DESC NULLS LAST, e.created_at DESC`;
-    }
-    
-    // Add pagination
-    query += ` LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
-    params.push(parseInt(limit), parseInt(offset));
-    
-    const result = await pool.query(query, params);
-    
-    // Get total count for pagination
-    let countQuery = `
-      SELECT COUNT(DISTINCT e.id) as total
-      FROM ebooks e
-      WHERE e.published = true
-    `;
-    
-    const countParams = [];
-    let countIndex = 1;
-    
-    if (length && length !== 'all') {
-      countQuery += ` AND e.length = $${countIndex}`;
-      countParams.push(length);
-      countIndex++;
-    }
-    
-    if (tag && tag !== 'all') {
-      countQuery += ` AND $${countIndex} = ANY(e.tags)`;
-      countParams.push(tag);
-      countIndex++;
-    }
-    
-    if (search) {
-      countQuery += ` AND (LOWER(e.title) LIKE LOWER($${countIndex}) OR LOWER(e.description) LIKE LOWER($${countIndex}))`;
-      countParams.push(`%${search}%`);
-      countIndex++;
-    }
-    
-    const countResult = await pool.query(countQuery, countParams);
-    
-    res.json({ 
-      ebooks: result.rows,
-      total: parseInt(countResult.rows[0].total)
-    });
-  } catch (error) {
-    console.error('Get ebooks error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get a specific ebook
-app.get('/api/ebooks/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    const result = await pool.query(`
-      SELECT 
-        e.*,
-        u.display_name as author_name,
-        u.tier as author_tier
-      FROM ebooks e
-      JOIN users u ON e.user_id = u.id
-      WHERE e.id = $1
-    `, [id]);
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Ebook not found' });
-    }
-    
-    const ebook = result.rows[0];
-    
-    // Only show published ebooks to non-owners
-    if (!ebook.published) {
-      const token = req.headers['authorization']?.split(' ')[1];
-      if (token) {
-        try {
-          const decoded = jwt.verify(token, process.env.JWT_SECRET);
-          if (decoded.userId !== ebook.user_id) {
-            return res.status(404).json({ error: 'Ebook not found' });
-          }
-        } catch {
-          return res.status(404).json({ error: 'Ebook not found' });
-        }
-      } else {
-        return res.status(404).json({ error: 'Ebook not found' });
-      }
-    }
-    
-    // Increment view count for published ebooks
-    if (ebook.published) {
-      const sessionKey = `ebook_view_${id}`;
-      const hasViewed = req.session[sessionKey];
-      
-      if (!hasViewed) {
-        await pool.query('UPDATE ebooks SET views = views + 1 WHERE id = $1', [id]);
-        req.session[sessionKey] = true;
-        const updatedViewResult = await pool.query('SELECT views FROM ebooks WHERE id = $1', [id]);
-        ebook.views = updatedViewResult.rows[0].views;
-      }
-    }
-    
-    res.json({ ebook });
-  } catch (error) {
-    console.error('Get ebook error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update an ebook
-app.put('/api/ebooks/:id', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { title, subtitle, description, cover_color } = req.body;
-    const userId = req.user.userId;
-
-    // Check if user owns the ebook
-    const ownerCheck = await pool.query(
-      'SELECT user_id FROM ebooks WHERE id = $1',
-      [id]
-    );
-
-    if (ownerCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Ebook not found' });
-    }
-
-    if (ownerCheck.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Not authorized to edit this ebook' });
-    }
-
-    // Validate input
-    if (title && title.length > 255) {
-      return res.status(400).json({ error: 'Title must be less than 255 characters' });
-    }
-
-    if (subtitle && subtitle.length > 255) {
-      return res.status(400).json({ error: 'Subtitle must be less than 255 characters' });
-    }
-
-    if (description && description.length > 5000) {
-      return res.status(400).json({ error: 'Description must be less than 5000 characters' });
-    }
-
-    // Update ebook
-    const result = await pool.query(
-      `UPDATE ebooks 
-       SET title = COALESCE($1, title), 
-           subtitle = COALESCE($2, subtitle), 
-           description = COALESCE($3, description), 
-           cover_color = COALESCE($4, cover_color),
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $5
-       RETURNING *`,
-      [title ? title.trim() : null, subtitle ? subtitle.trim() : null, description ? description.trim() : null, cover_color, id]
-    );
-
-    res.json({
-      message: 'Ebook updated successfully',
-      ebook: result.rows[0]
-    });
-
-  } catch (error) {
-    console.error('Update ebook error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Delete an ebook
-app.delete('/api/ebooks/:id', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const userId = req.user.userId;
-
-    // Check if user owns the ebook
-    const ownerCheck = await pool.query(
-      'SELECT user_id FROM ebooks WHERE id = $1',
-      [id]
-    );
-
-    if (ownerCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Ebook not found' });
-    }
-
-    if (ownerCheck.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Not authorized to delete this ebook' });
-    }
-
-    // Delete ebook (chapters will be deleted due to CASCADE)
-    await pool.query('DELETE FROM ebooks WHERE id = $1', [id]);
-
-    res.json({ message: 'Ebook deleted successfully' });
-
-  } catch (error) {
-    console.error('Delete ebook error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Publish an ebook
-app.post('/api/ebooks/:id/publish', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { tags, length, isbn, license } = req.body;
-    const userId = req.user.userId;
-
-    // Check if user owns the ebook
-    const ownerCheck = await pool.query(
-      'SELECT user_id, published FROM ebooks WHERE id = $1',
-      [id]
-    );
-
-    if (ownerCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Ebook not found' });
-    }
-
-    if (ownerCheck.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Not authorized to publish this ebook' });
-    }
-
-    if (ownerCheck.rows[0].published) {
-      return res.status(400).json({ error: 'Ebook is already published' });
-    }
-
-    // Check if ebook has at least one chapter
-    const chapterCheck = await pool.query(
-      'SELECT COUNT(*) as count FROM ebook_chapters WHERE ebook_id = $1',
-      [id]
-    );
-
-    if (parseInt(chapterCheck.rows[0].count) === 0) {
-      return res.status(400).json({ error: 'Ebook must have at least one chapter to be published' });
-    }
-
-    // Check weekly limit
-    const userResult = await pool.query(
-      'SELECT weekly_ebooks_count FROM users WHERE id = $1',
-      [userId]
-    );
-
-    const weeklyLimit = 2; // Default limit
-    if (userResult.rows[0].weekly_ebooks_count >= weeklyLimit) {
-      return res.status(400).json({ error: 'Weekly ebook limit reached' });
-    }
-
-    // Publish ebook
-    const result = await pool.query(
-      `UPDATE ebooks 
-       SET published = true, 
-           published_at = CURRENT_TIMESTAMP,
-           tags = $1,
-           length = $2,
-           isbn = $3,
-           license = $4,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $5
-       RETURNING *`,
-      [tags || [], length || 'short', isbn || null, license || 'all-rights-reserved', id]
-    );
-
-    // Update weekly count
-    await pool.query(
-      'UPDATE users SET weekly_ebooks_count = weekly_ebooks_count + 1 WHERE id = $1',
-      [userId]
-    );
-
-    // Award points for publishing an ebook
-    await awardPoints(userId, 'ebook_published', 15, parseInt(id), 'ebook');
-
-    res.json({
-      message: 'Ebook published successfully',
-      ebook: result.rows[0]
-    });
-
-  } catch (error) {
-    console.error('Publish ebook error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get all chapters for an ebook
-app.get('/api/ebooks/:id/chapters', async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    // First check if ebook exists and user has access
-    const ebookCheck = await pool.query(
-      'SELECT user_id, published FROM ebooks WHERE id = $1',
-      [id]
-    );
-
-    if (ebookCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Ebook not found' });
-    }
-
-    const ebook = ebookCheck.rows[0];
-    
-    // Only show chapters of published ebooks to non-owners
-    if (!ebook.published) {
-      const token = req.headers['authorization']?.split(' ')[1];
-      if (token) {
-        try {
-          const decoded = jwt.verify(token, process.env.JWT_SECRET);
-          if (decoded.userId !== ebook.user_id) {
-            return res.status(404).json({ error: 'Ebook not found' });
-          }
-        } catch {
-          return res.status(404).json({ error: 'Ebook not found' });
-        }
-      } else {
-        return res.status(404).json({ error: 'Ebook not found' });
-      }
-    }
-    
-    // Get chapters
-    const result = await pool.query(
-      'SELECT * FROM ebook_chapters WHERE ebook_id = $1 ORDER BY order_index ASC',
-      [id]
-    );
-    
-    res.json({ chapters: result.rows });
-  } catch (error) {
-    console.error('Get chapters error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Create a new chapter for an ebook
-app.post('/api/ebooks/:id/chapters', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { title, content } = req.body;
-    const userId = req.user.userId;
-
-    // Check if user owns the ebook
-    const ownerCheck = await pool.query(
-      'SELECT user_id FROM ebooks WHERE id = $1',
-      [id]
-    );
-
-    if (ownerCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Ebook not found' });
-    }
-
-    if (ownerCheck.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Not authorized to add chapters to this ebook' });
-    }
-
-    // Validate input
-    if (!title || !title.trim()) {
-      return res.status(400).json({ error: 'Chapter title is required' });
-    }
-
-    if (!content || !content.trim()) {
-      return res.status(400).json({ error: 'Chapter content is required' });
-    }
-
-    // Get the next order index
-    const orderResult = await pool.query(
-      'SELECT COALESCE(MAX(order_index), 0) + 1 as next_index FROM ebook_chapters WHERE ebook_id = $1',
-      [id]
-    );
-
-    const nextIndex = parseInt(orderResult.rows[0].next_index);
-
-    // Count words in content
-    const wordCount = content.trim().split(/\s+/).filter(word => word.length > 0).length;
-
-    // Create chapter
-    const result = await pool.query(
-      `INSERT INTO ebook_chapters (ebook_id, title, content, word_count, order_index)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING *`,
-      [id, title.trim(), content.trim(), wordCount, nextIndex]
-    );
-
-    res.status(201).json({
-      message: 'Chapter created successfully',
-      chapter: result.rows[0]
-    });
-
-  } catch (error) {
-    console.error('Create chapter error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get a specific chapter
-app.get('/api/ebooks/:id/chapters/:chapterId', async (req, res) => {
-  try {
-    const { id, chapterId } = req.params;
-    
-    // First check if ebook exists and user has access
-    const ebookCheck = await pool.query(
-      'SELECT user_id, published FROM ebooks WHERE id = $1',
-      [id]
-    );
-
-    if (ebookCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Ebook not found' });
-    }
-
-    const ebook = ebookCheck.rows[0];
-    
-    // Only show chapters of published ebooks to non-owners
-    if (!ebook.published) {
-      const token = req.headers['authorization']?.split(' ')[1];
-      if (token) {
-        try {
-          const decoded = jwt.verify(token, process.env.JWT_SECRET);
-          if (decoded.userId !== ebook.user_id) {
-            return res.status(404).json({ error: 'Ebook not found' });
-          }
-        } catch {
-          return res.status(404).json({ error: 'Ebook not found' });
-        }
-      } else {
-        return res.status(404).json({ error: 'Ebook not found' });
-      }
-    }
-    
-    // Get chapter
-    const result = await pool.query(
-      'SELECT * FROM ebook_chapters WHERE id = $1 AND ebook_id = $2',
-      [chapterId, id]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Chapter not found' });
-    }
-    
-    res.json({ chapter: result.rows[0] });
-  } catch (error) {
-    console.error('Get chapter error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update a chapter
-app.put('/api/ebooks/:id/chapters/:chapterId', authenticateToken, async (req, res) => {
-  try {
-    const { id, chapterId } = req.params;
-    const { title, content } = req.body;
-    const userId = req.user.userId;
-
-    // Check if user owns the ebook
-    const ownerCheck = await pool.query(
-      'SELECT e.user_id FROM ebooks e JOIN ebook_chapters ec ON e.id = ec.ebook_id WHERE e.id = $1 AND ec.id = $2',
-      [id, chapterId]
-    );
-
-    if (ownerCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Chapter not found' });
-    }
-
-    if (ownerCheck.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Not authorized to edit this chapter' });
-    }
-
-    // Validate input
-    if (title && title.length > 255) {
-      return res.status(400).json({ error: 'Chapter title must be less than 255 characters' });
-    }
-
-    // Count words in content if provided
-    let wordCount = null;
-    if (content) {
-      wordCount = content.trim().split(/\s+/).filter(word => word.length > 0).length;
-    }
-
-    // Update chapter
-    const result = await pool.query(
-      `UPDATE ebook_chapters 
-       SET title = COALESCE($1, title), 
-           content = COALESCE($2, content),
-           word_count = COALESCE($3, word_count),
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $4 AND ebook_id = $5
-       RETURNING *`,
-      [title ? title.trim() : null, content ? content.trim() : null, wordCount, chapterId, id]
-    );
-
-    res.json({
-      message: 'Chapter updated successfully',
-      chapter: result.rows[0]
-    });
-
-  } catch (error) {
-    console.error('Update chapter error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Delete a chapter
-app.delete('/api/ebooks/:id/chapters/:chapterId', authenticateToken, async (req, res) => {
-  try {
-    const { id, chapterId } = req.params;
-    const userId = req.user.userId;
-
-    // Check if user owns the ebook
-    const ownerCheck = await pool.query(
-      'SELECT e.user_id FROM ebooks e JOIN ebook_chapters ec ON e.id = ec.ebook_id WHERE e.id = $1 AND ec.id = $2',
-      [id, chapterId]
-    );
-
-    if (ownerCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Chapter not found' });
-    }
-
-    if (ownerCheck.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Not authorized to delete this chapter' });
-    }
-
-    // Delete chapter
-    await pool.query('DELETE FROM ebook_chapters WHERE id = $1 AND ebook_id = $2', [chapterId, id]);
-
-    // Reorder remaining chapters
-    await pool.query(
-      `UPDATE ebook_chapters 
-       SET order_index = new_order
-       FROM (
-         SELECT id, ROW_NUMBER() OVER (ORDER BY order_index) as new_order
-         FROM ebook_chapters
-         WHERE ebook_id = $1
-       ) as reordered
-       WHERE ebook_chapters.id = reordered.id`,
-      [id]
-    );
-
-    res.json({ message: 'Chapter deleted successfully' });
-
-  } catch (error) {
-    console.error('Delete chapter error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Reorder chapters
-app.put('/api/ebooks/:id/chapters/reorder', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { chapter_ids } = req.body;
-    const userId = req.user.userId;
-
-    // Check if user owns the ebook
-    const ownerCheck = await pool.query(
-      'SELECT user_id FROM ebooks WHERE id = $1',
-      [id]
-    );
-
-    if (ownerCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Ebook not found' });
-    }
-
-    if (ownerCheck.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Not authorized to reorder chapters in this ebook' });
-    }
-
-    // Validate chapter_ids
-    if (!Array.isArray(chapter_ids) || chapter_ids.length === 0) {
-      return res.status(400).json({ error: 'Chapter IDs are required' });
-    }
-
-    // Verify all chapters belong to this ebook
-    const chapterCheck = await pool.query(
-      'SELECT COUNT(*) as count FROM ebook_chapters WHERE ebook_id = $1 AND id = ANY($2)',
-      [id, chapter_ids]
-    );
-
-    if (parseInt(chapterCheck.rows[0].count) !== chapter_ids.length) {
-      return res.status(400).json({ error: 'One or more chapters do not belong to this ebook' });
-    }
-
-    // Update order indices
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      
-      for (let i = 0; i < chapter_ids.length; i++) {
-        await client.query(
-          'UPDATE ebook_chapters SET order_index = $1 WHERE id = $2 AND ebook_id = $3',
-          [i + 1, chapter_ids[i], id]
-        );
-      }
-      
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-
-    res.json({ message: 'Chapters reordered successfully' });
-
-  } catch (error) {
-    console.error('Reorder chapters error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get user's reading progress for an ebook
-app.get('/api/ebooks/:id/reading-progress', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const userId = req.user.userId;
-
-    // Check if ebook exists and is published
-    const ebookCheck = await pool.query(
-      'SELECT id FROM ebooks WHERE id = $1 AND published = true',
-      [id]
-    );
-
-    if (ebookCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Ebook not found or not published' });
-    }
-
-    // Get reading progress
-    const result = await pool.query(
-      'SELECT * FROM ebook_reading_progress WHERE user_id = $1 AND ebook_id = $2',
-      [userId, id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.json({ progress: null });
-    }
-
-    res.json({ progress: result.rows[0] });
-
-  } catch (error) {
-    console.error('Get reading progress error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update user's reading progress for an ebook
-app.post('/api/ebooks/:id/reading-progress', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { current_chapter_id, progress_percent } = req.body;
-    const userId = req.user.userId;
-
-    // Check if ebook exists and is published
-    const ebookCheck = await pool.query(
-      'SELECT id FROM ebooks WHERE id = $1 AND published = true',
-      [id]
-    );
-
-    if (ebookCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Ebook not found or not published' });
-    }
-
-    // Check if chapter exists and belongs to this ebook
-    if (current_chapter_id) {
-      const chapterCheck = await pool.query(
-        'SELECT id FROM ebook_chapters WHERE id = $1 AND ebook_id = $2',
-        [current_chapter_id, id]
-      );
-
-      if (chapterCheck.rows.length === 0) {
-        return res.status(400).json({ error: 'Chapter does not belong to this ebook' });
-      }
-    }
-
-    // Validate progress_percent
-    if (progress_percent < 0 || progress_percent > 100) {
-      return res.status(400).json({ error: 'Progress percent must be between 0 and 100' });
-    }
-
-    // Update or create reading progress
-    const result = await pool.query(
-      `INSERT INTO ebook_reading_progress (user_id, ebook_id, current_chapter_id, progress_percent)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (user_id, ebook_id)
-       DO UPDATE SET
-         current_chapter_id = EXCLUDED.current_chapter_id,
-         progress_percent = EXCLUDED.progress_percent,
-         updated_at = CURRENT_TIMESTAMP
-       RETURNING *`,
-      [userId, id, current_chapter_id || null, progress_percent || 0]
-    );
-
-    res.json({
-      message: 'Reading progress updated successfully',
-      progress: result.rows[0]
-    });
-
-  } catch (error) {
-    console.error('Update reading progress error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get user's ebooks
-app.get('/api/user/ebooks', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    
-    const result = await pool.query(
-      `SELECT 
-        e.*,
-        COUNT(ec.id) as chapter_count,
-        COALESCE(SUM(ec.word_count), 0) as total_words
-      FROM ebooks e
-      LEFT JOIN ebook_chapters ec ON e.id = ec.ebook_id
-      WHERE e.user_id = $1
-      GROUP BY e.id
-      ORDER BY e.updated_at DESC`,
-      [userId]
-    );
-    
-    res.json({ ebooks: result.rows });
-  } catch (error) {
-    console.error('Get user ebooks error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get user's public ebooks
-app.get('/api/users/:username/ebooks', async (req, res) => {
-  try {
-    const { username } = req.params;
-    
-    // Get user ID
-    const userResult = await pool.query(
-      'SELECT id, display_name, tier FROM users WHERE display_name = $1 AND account_status = $2',
-      [username, 'active']
-    );
-    
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    const user = userResult.rows[0];
-    
-    // Get user's published ebooks
-    const result = await pool.query(
-      `SELECT 
-        e.*,
-        COUNT(ec.id) as chapter_count,
-        COALESCE(SUM(ec.word_count), 0) as total_words
-      FROM ebooks e
-      LEFT JOIN ebook_chapters ec ON e.id = ec.ebook_id
-      WHERE e.user_id = $1 AND e.published = true
-      GROUP BY e.id
-      ORDER BY e.published_at DESC NULLS LAST, e.updated_at DESC`,
-      [user.id]
-    );
-    
-    res.json({ 
-      user: {
-        display_name: user.display_name,
-        tier: user.tier
-      },
-      ebooks: result.rows 
-    });
-  } catch (error) {
-    console.error('Get user public ebooks error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+}, 60 * 60 * 1000); // Every hour
 
 // Add this catch-all route at very end, before error handling middleware
 // This serves the React app for any route that doesn't match API routes
