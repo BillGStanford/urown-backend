@@ -847,6 +847,68 @@ const initDatabase = async () => {
     `);
 
     await pool.query(`
+  ALTER TABLE ebooks 
+  ADD COLUMN IF NOT EXISTS slug VARCHAR(255) UNIQUE
+`);
+
+await pool.query(`
+  CREATE OR REPLACE FUNCTION generate_ebook_slug(title VARCHAR, author_name VARCHAR, id INTEGER)
+  RETURNS VARCHAR AS $$   DECLARE
+    base_slug VARCHAR;
+    unique_slug VARCHAR;
+    counter INTEGER := 1;
+  BEGIN
+    -- Create base slug from title and author
+    base_slug := LOWER(
+      REGEXP_REPLACE(
+        REGEXP_REPLACE(title || '-' || author_name, '[^a-zA-Z0-9\\s]', '', 'g'),
+        '\\s+', '-', 'g'
+      )
+    );
+    
+    -- Truncate if too long
+    IF LENGTH(base_slug) > 60 THEN
+      base_slug := SUBSTRING(base_slug, 1, 60);
+    END IF;
+    
+    -- Make sure it ends with alphanumeric
+    base_slug := REGEXP_REPLACE(base_slug, '-+$', '');
+    
+    -- Try to create a unique slug
+    unique_slug := base_slug;
+    WHILE EXISTS (SELECT 1 FROM ebooks WHERE slug = unique_slug AND id != id) LOOP
+      unique_slug := base_slug || '-' || counter;
+      counter := counter + 1;
+    END LOOP;
+    
+    RETURN unique_slug;
+  END;
+  $$ LANGUAGE plpgsql;
+`);
+
+// Create a trigger to automatically generate slugs
+await pool.query(`
+  CREATE OR REPLACE FUNCTION update_ebook_slug()
+  RETURNS TRIGGER AS $$   BEGIN
+    IF NEW.slug IS NULL OR NEW.slug = '' THEN
+      NEW.slug := generate_ebook_slug(NEW.title, 
+        (SELECT display_name FROM users WHERE id = NEW.user_id), 
+        NEW.id);
+    END IF;
+    RETURN NEW;
+  END;
+  $$ LANGUAGE plpgsql;
+`);
+
+await pool.query(`
+  DROP TRIGGER IF EXISTS trigger_ebook_slug ON ebooks;
+  CREATE TRIGGER trigger_ebook_slug
+  BEFORE INSERT OR UPDATE ON ebooks
+  FOR EACH ROW
+  EXECUTE FUNCTION update_ebook_slug();
+`);
+
+    await pool.query(`
       DROP TRIGGER IF EXISTS trigger_new_follower ON followers;
       CREATE TRIGGER trigger_new_follower
       AFTER INSERT ON followers
@@ -3575,6 +3637,7 @@ const ebooksResult = await pool.query(
   [user.id]
 );
 
+
 const totalArticleViews = articlesResult.rows.reduce((sum, article) => sum + (article.views || 0), 0);
 const totalEbookViews = ebooksResult.rows.reduce((sum, ebook) => sum + (ebook.views || 0), 0);
     
@@ -4589,7 +4652,8 @@ app.post('/api/ebooks/:id/publish', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Maximum 5 tags allowed' });
     }
 
-    const ebookCountResult = await pool.query(
+// Check if this is user's first ebook
+const ebookCountResult = await pool.query(
   'SELECT COUNT(*) as count FROM ebooks WHERE user_id = $1 AND published = true',
   [userId]
 );
