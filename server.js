@@ -4389,21 +4389,23 @@ app.get('/api/ebooks', async (req, res) => {
   }
 });
 
-// Get single ebook (public)
-// Replace the existing /api/ebooks/:id endpoint with this improved version:
 
+// Get single ebook (public)
 // Get single ebook (public)
 app.get('/api/ebooks/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
     // Use LEFT JOIN instead of JOIN to handle deleted users
+    // IMPORTANT: Use e.* last or specify all columns explicitly to avoid ambiguous 'id' reference
     const result = await pool.query(`
       SELECT 
-        e.*, 
+        e.id, e.user_id, e.title, e.subtitle, e.description, e.cover_color,
+        e.language, e.length, e.tags, e.license, e.isbn,
+        e.published, e.views, e.chapter_count, e.total_word_count,
+        e.created_at, e.updated_at, e.published_at,
         COALESCE(u.display_name, 'Unknown Author') as author_name, 
-        COALESCE(u.tier, 'Guest') as author_tier, 
-        e.user_id
+        COALESCE(u.tier, 'Guest') as author_tier
       FROM ebooks e
       LEFT JOIN users u ON e.user_id = u.id
       WHERE e.id = $1
