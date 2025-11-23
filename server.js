@@ -4390,20 +4390,30 @@ app.get('/api/ebooks', async (req, res) => {
 });
 
 // Get single ebook (public)
+// Replace the existing /api/ebooks/:id endpoint with this improved version:
+
+// Get single ebook (public)
 app.get('/api/ebooks/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
+    // Use LEFT JOIN instead of JOIN to handle deleted users
     const result = await pool.query(`
       SELECT 
-        e.*, u.display_name as author_name, u.tier as author_tier, u.id as user_id
+        e.*, 
+        COALESCE(u.display_name, 'Unknown Author') as author_name, 
+        COALESCE(u.tier, 'Guest') as author_tier, 
+        e.user_id
       FROM ebooks e
-      JOIN users u ON e.user_id = u.id
+      LEFT JOIN users u ON e.user_id = u.id
       WHERE e.id = $1
     `, [id]);
     
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Book not found' });
+      return res.status(404).json({ 
+        error: 'Book not found',
+        details: 'This book does not exist or has been removed'
+      });
     }
     
     const ebook = result.rows[0];
@@ -4412,20 +4422,29 @@ app.get('/api/ebooks/:id', async (req, res) => {
     if (!ebook.published) {
       const token = req.headers['authorization']?.split(' ')[1];
       if (!token) {
-        return res.status(404).json({ error: 'Book not found' });
+        return res.status(404).json({ 
+          error: 'Book not found',
+          details: 'This book is not published yet'
+        });
       }
       
       try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         if (decoded.userId !== ebook.user_id) {
-          return res.status(404).json({ error: 'Book not found' });
+          return res.status(404).json({ 
+            error: 'Book not found',
+            details: 'This book is not published yet'
+          });
         }
-      } catch {
-        return res.status(404).json({ error: 'Book not found' });
+      } catch (jwtError) {
+        return res.status(404).json({ 
+          error: 'Book not found',
+          details: 'This book is not published yet'
+        });
       }
     }
     
-    // Track view (session-based)
+    // Track view (session-based) - only for published books
     if (ebook.published) {
       const sessionKey = `ebook_view_${id}`;
       if (!req.session[sessionKey]) {
@@ -4439,11 +4458,14 @@ app.get('/api/ebooks/:id', async (req, res) => {
     res.json({ ebook });
   } catch (error) {
     console.error('Get ebook error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ 
+      error: 'Internal server error',
+      details: error.message 
+    });
   }
 });
 
-// Create new ebook (authenticated)
+
 // Create new ebook (authenticated)
 app.post('/api/ebooks', authenticateToken, async (req, res) => {
   try {
