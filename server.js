@@ -40,6 +40,7 @@ if (process.env.DATABASE_URL) {
 }
 
 // Middleware
+// More permissive CORS for production
 app.use(cors({
   origin: [
     'https://urown-delta.vercel.app',
@@ -51,24 +52,85 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
+// Handle preflight requests
 app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Serve static files
+// Serve static files from the React app
 const buildPath = path.join(__dirname, '../urown-frontend/build');
 const publicPath = path.join(__dirname, '../urown-frontend/public');
 
+// Check if build directory exists before serving it
 if (fs.existsSync(buildPath)) {
   app.use(express.static(buildPath));
 } else {
   console.log('Build directory not found. Using public directory for static files.');
 }
 
+// Check if public directory exists before serving it
 if (fs.existsSync(publicPath)) {
   app.use(express.static(publicPath));
 } else {
   console.log('Public directory not found. Some static files may not be available.');
 }
+
+// Handle specific static files explicitly with fallbacks
+app.get('/favicon.ico', (req, res) => {
+  const faviconPath = path.join(publicPath, 'favicon.ico');
+  if (fs.existsSync(faviconPath)) {
+    res.sendFile(faviconPath);
+  } else {
+    res.status(404).send('Favicon not found');
+  }
+});
+
+app.get('/apple-touch-icon.png', (req, res) => {
+  const iconPath = path.join(publicPath, 'apple-touch-icon.png');
+  if (fs.existsSync(iconPath)) {
+    res.sendFile(iconPath);
+  } else {
+    // Create a simple 180x180 PNG icon as a fallback
+    try {
+      // Try to use canvas if available
+      const { createCanvas } = require('canvas');
+      const canvas = createCanvas(180, 180);
+      const ctx = canvas.getContext('2d');
+      
+      // Draw a simple icon
+      ctx.fillStyle = '#4F46E5'; // Indigo color
+      ctx.fillRect(0, 0, 180, 180);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold 80px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('U', 90, 90);
+      
+      // Convert to PNG and send
+      res.type('png');
+      res.send(canvas.toBuffer());
+    } catch (err) {
+      // If canvas module is not available, create a simple SVG icon
+      const svgIcon = `
+        <svg width="180" height="180" xmlns="http://www.w3.org/2000/svg">
+          <rect width="180" height="180" fill="#4F46E5"/>
+          <text x="90" y="90" font-family="Arial" font-size="80" font-weight="bold" 
+                text-anchor="middle" dominant-baseline="middle" fill="white">U</text>
+        </svg>
+      `;
+      res.setHeader('Content-Type', 'image/svg+xml');
+      res.send(svgIcon);
+    }
+  }
+});
+
+app.get('/manifest.json', (req, res) => {
+  const manifestPath = path.join(publicPath, 'manifest.json');
+  if (fs.existsSync(manifestPath)) {
+    res.sendFile(manifestPath);
+  } else {
+    res.status(404).send('Manifest not found');
+  }
+});
 
 // Session configuration
 app.use(session({
@@ -80,13 +142,13 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    maxAge: 30 * 24 * 60 * 60 * 1000,
+    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
     secure: process.env.NODE_ENV === 'production',
     httpOnly: true
   }
 }));
 
-// Rate limiting
+// Environment-based rate limiting
 const isDevelopment = process.env.NODE_ENV === 'development';
 
 const generalLimiter = rateLimit({
@@ -97,6 +159,7 @@ const generalLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// More lenient rate limiting for authenticated routes
 const authLimiter = rateLimit({
   windowMs: parseInt(process.env.AUTH_RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
   max: isDevelopment ? 20000 : parseInt(process.env.AUTH_RATE_LIMIT_MAX_REQUESTS) || 2000,
@@ -106,177 +169,18 @@ const authLimiter = rateLimit({
   skip: (req) => !req.user,
 });
 
+// Apply general limiter to all routes
 app.use('/api', generalLimiter);
+
+// Apply more lenient limiter to authenticated routes
 app.use('/api/user', authLimiter);
-
-// Helper function to award points
-const awardPoints = async (userId, activityType, points, referenceId = null, referenceType = null) => {
-  try {
-    await pool.query(
-      'SELECT update_user_score($1, $2, $3, $4, $5)',
-      [userId, activityType, points, referenceId, referenceType]
-    );
-  } catch (error) {
-    console.error('Error awarding points:', error);
-  }
-};
-
-// JWT middleware
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
-  }
-
-  jwt.verify(token, process.env.JWT_SECRET, async (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-    
-    // Check if user is banned
-    try {
-      const banResult = await pool.query(
-        'SELECT ban_end, reason FROM user_bans WHERE user_id = $1 AND ban_end > CURRENT_TIMESTAMP',
-        [user.userId]
-      );
-
-      if (banResult.rows.length > 0) {
-        const ban = banResult.rows[0];
-        const banEnd = new Date(ban.ban_end);
-        const now = new Date();
-        const diffMs = banEnd - now;
-        const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-        const diffHours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-
-        let timeLeft = '';
-        if (diffDays > 0) {
-          timeLeft = `${diffDays} day${diffDays !== 1 ? 's' : ''}`;
-          if (diffHours > 0) {
-            timeLeft += ` and ${diffHours} hour${diffHours !== 1 ? 's' : ''}`;
-          }
-        } else {
-          timeLeft = `${diffHours} hour${diffHours !== 1 ? 's' : ''}`;
-        }
-
-        return res.status(401).json({ 
-          error: `Your account has been banned. Reason: "${ban.reason}." The ban will expire in ${timeLeft}. If you disagree contact us at, nilecommun@gmail.com` 
-        });
-      }
-    } catch (error) {
-      console.error('Error checking ban status:', error);
-    }
-
-    req.user = user;
-    next();
-  });
-};
-
-// Middleware to check if user is an admin
-const authenticateAdmin = (req, res, next) => {
-  authenticateToken(req, res, async () => {
-    try {
-      const result = await pool.query(
-        'SELECT role FROM users WHERE id = $1',
-        [req.user.userId]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(401).json({ 
-          error: 'User not found. Your session may have expired. Please log in again.' 
-        });
-      }
-
-      const user = result.rows[0];
-      
-      if (user.role !== 'admin' && user.role !== 'super-admin') {
-        return res.status(403).json({ error: 'Access denied. Admin privileges required.' });
-      }
-
-      req.user.role = user.role;
-      next();
-    } catch (error) {
-      console.error('Admin authentication error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  });
-};
-
-// Middleware to check if user is a super-admin
-const authenticateSuperAdmin = (req, res, next) => {
-  authenticateToken(req, res, async () => {
-    try {
-      const result = await pool.query(
-        'SELECT role FROM users WHERE id = $1',
-        [req.user.userId]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      const user = result.rows[0];
-      
-      if (user.role !== 'super-admin') {
-        return res.status(403).json({ error: 'Access denied. Super-admin privileges required.' });
-      }
-
-      req.user.role = user.role;
-      next();
-    } catch (error) {
-      console.error('Super-admin authentication error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  });
-};
-
-// Middleware to check if user is an editorial board member
-const authenticateEditorialBoard = (req, res, next) => {
-  authenticateToken(req, res, async () => {
-    try {
-      const result = await pool.query(
-        'SELECT role FROM users WHERE id = $1',
-        [req.user.userId]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      const user = result.rows[0];
-      
-      if (user.role !== 'editorial-board' && user.role !== 'admin' && user.role !== 'super-admin') {
-        return res.status(403).json({ error: 'Access denied. Editorial board privileges required.' });
-      }
-
-      req.user.role = user.role;
-      next();
-    } catch (error) {
-      console.error('Editorial board authentication error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  });
-};
-
-// Function to log admin actions
-const logAdminAction = async (adminId, action, targetType, targetId, details = null) => {
-  try {
-    await pool.query(
-      `INSERT INTO audit_log (admin_id, action, target_type, target_id, details)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [adminId, action, targetType, targetId, details]
-    );
-  } catch (error) {
-    console.error('Error logging admin action:', error);
-  }
-};
 
 // Database initialization
 const initDatabase = async () => {
   try {
     // Check if the full_name column needs to be modified
     try {
+      // First check if the column exists and its constraints
       const columnCheck = await pool.query(`
         SELECT column_name, is_nullable 
         FROM information_schema.columns 
@@ -284,6 +188,7 @@ const initDatabase = async () => {
       `);
       
       if (columnCheck.rows.length > 0 && columnCheck.rows[0].is_nullable === 'NO') {
+        // If the column exists but doesn't allow NULL, alter it
         await pool.query(`
           ALTER TABLE users ALTER COLUMN full_name DROP NOT NULL
         `);
@@ -293,7 +198,7 @@ const initDatabase = async () => {
       console.log('Could not alter full_name column:', alterError.message);
     }
     
-    // Create users table first
+    // Create users table first (no dependencies)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -321,6 +226,7 @@ const initDatabase = async () => {
         hard_deleted_at TIMESTAMP,
         deletion_reason TEXT,
         followers INTEGER DEFAULT 0,
+        invite_code VARCHAR(5),
         CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
       )
     `);
@@ -337,7 +243,7 @@ const initDatabase = async () => {
       console.log('Discord username columns may already exist:', error.message);
     }
 
-    // Create index for faster lookups
+    // Create index for faster lookups (optional but recommended)
     try {
       await pool.query(`
         CREATE INDEX IF NOT EXISTS idx_users_discord_username ON users(discord_username)
@@ -368,6 +274,7 @@ const initDatabase = async () => {
       ADD COLUMN IF NOT EXISTS last_score_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     `);
 
+    // Create index for faster leaderboard queries
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_users_urown_score ON users(urown_score DESC)
     `);
@@ -415,8 +322,7 @@ const initDatabase = async () => {
         p_points INTEGER,
         p_reference_id INTEGER DEFAULT NULL,
         p_reference_type VARCHAR(50) DEFAULT NULL
-      ) RETURNS INTEGER AS $$       
-      DECLARE
+      ) RETURNS INTEGER AS $$       DECLARE
         v_new_score INTEGER;
         v_old_rank INTEGER;
         v_new_rank INTEGER;
@@ -492,7 +398,7 @@ const initDatabase = async () => {
       )
     `);
 
-    // Create debate_topics table
+    // Create debate_topics table (referenced by articles)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS debate_topics (
         id SERIAL PRIMARY KEY,
@@ -504,7 +410,7 @@ const initDatabase = async () => {
       )
     `);
 
-    // Create articles table
+    // Create articles table (references debate_topics)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS articles (
         id SERIAL PRIMARY KEY,
@@ -644,6 +550,7 @@ const initDatabase = async () => {
       )
     `);
 
+    // Create index for faster queries
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
       CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
@@ -660,6 +567,7 @@ const initDatabase = async () => {
       )
     `);
 
+    // Create indexes for faster queries
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_bookmarks_user_id ON bookmarks(user_id);
       CREATE INDEX IF NOT EXISTS idx_bookmarks_article_id ON bookmarks(article_id);
@@ -667,7 +575,30 @@ const initDatabase = async () => {
     `);
 
     console.log('Bookmarks table initialized successfully');
-    
+
+    // ============================================
+    // INVITE CODES TABLE
+    // ============================================
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS invite_codes (
+        id SERIAL PRIMARY KEY,
+        code VARCHAR(5) UNIQUE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        active BOOLEAN DEFAULT TRUE,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_invite_codes_code ON invite_codes(code);
+      CREATE INDEX IF NOT EXISTS idx_invite_codes_active ON invite_codes(active);
+    `);
+
+    console.log('Invite codes table initialized successfully');
+
     // ============================================
     // REDFLAGGED TABLES
     // ============================================
@@ -743,8 +674,7 @@ const initDatabase = async () => {
     // Create trigger function to create notification on new follower
     await pool.query(`
       CREATE OR REPLACE FUNCTION notify_new_follower()
-      RETURNS TRIGGER AS $$       
-      BEGIN
+      RETURNS TRIGGER AS $$       BEGIN
         INSERT INTO notifications (user_id, type, message, link)
         VALUES (
           NEW.following_id,
@@ -768,8 +698,7 @@ const initDatabase = async () => {
     // Create trigger function to create notification on counter argument
     await pool.query(`
       CREATE OR REPLACE FUNCTION notify_counter_argument()
-      RETURNS TRIGGER AS $$       
-      DECLARE
+      RETURNS TRIGGER AS $$       DECLARE
         parent_user_id INTEGER;
         parent_title TEXT;
       BEGIN
@@ -806,8 +735,7 @@ const initDatabase = async () => {
     // Create trigger function to notify followers of new posts
     await pool.query(`
       CREATE OR REPLACE FUNCTION notify_followers_new_post()
-      RETURNS TRIGGER AS $$       
-      BEGIN
+      RETURNS TRIGGER AS $$       BEGIN
         IF NEW.published = TRUE AND NEW.parent_article_id IS NULL AND NEW.debate_topic_id IS NULL THEN
           INSERT INTO notifications (user_id, type, message, link)
           SELECT 
@@ -867,7 +795,173 @@ const initDatabase = async () => {
   }
 };
 
-// Validation middleware
+// Helper function to award points
+const awardPoints = async (userId, activityType, points, referenceId = null, referenceType = null) => {
+  try {
+    await pool.query(
+      'SELECT update_user_score($1, $2, $3, $4, $5)',
+      [userId, activityType, points, referenceId, referenceType]
+    );
+  } catch (error) {
+    console.error('Error awarding points:', error);
+  }
+};
+
+// JWT middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, async (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    
+    // Check if user is banned
+    try {
+      const banResult = await pool.query(
+        'SELECT ban_end, reason FROM user_bans WHERE user_id = $1 AND ban_end > CURRENT_TIMESTAMP',
+        [user.userId]
+      );
+
+      if (banResult.rows.length > 0) {
+        const ban = banResult.rows[0];
+        // Calculate remaining time in a human-readable format
+        const banEnd = new Date(ban.ban_end);
+        const now = new Date();
+        const diffMs = banEnd - now;
+        const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+        const diffHours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+
+        let timeLeft = '';
+        if (diffDays > 0) {
+          timeLeft = `${diffDays} day${diffDays !== 1 ? 's' : ''}`;
+          if (diffHours > 0) {
+            timeLeft += ` and ${diffHours} hour${diffHours !== 1 ? 's' : ''}`;
+          }
+        } else {
+          timeLeft = `${diffHours} hour${diffHours !== 1 ? 's' : ''}`;
+        }
+
+        return res.status(401).json({ 
+          error: `Your account has been banned. Reason: "${ban.reason}." The ban will expire in ${timeLeft}. If you disagree contact us at, nilecommun@gmail.com` 
+        });
+      }
+    } catch (error) {
+      console.error('Error checking ban status:', error);
+      // Continue to next if there's an error checking ban
+    }
+
+    req.user = user;
+    next();
+  });
+};
+
+// Middleware to check if user is an admin
+const authenticateAdmin = (req, res, next) => {
+  authenticateToken(req, res, async () => {
+    try {
+      const result = await pool.query(
+        'SELECT role FROM users WHERE id = $1',
+        [req.user.userId]
+      );
+
+      if (result.rows.length === 0) {
+        console.error(`User not found in database: ${req.user.userId}`);
+        return res.status(401).json({ 
+          error: 'User not found. Your session may have expired. Please log in again.' 
+        });
+      }
+
+      const user = result.rows[0];
+      
+      if (user.role !== 'admin' && user.role !== 'super-admin') {
+        return res.status(403).json({ error: 'Access denied. Admin privileges required.' });
+      }
+
+      req.user.role = user.role;
+      next();
+    } catch (error) {
+      console.error('Admin authentication error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+};
+
+// Middleware to check if user is a super-admin
+const authenticateSuperAdmin = (req, res, next) => {
+  authenticateToken(req, res, async () => {
+    try {
+      const result = await pool.query(
+        'SELECT role FROM users WHERE id = $1',
+        [req.user.userId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      const user = result.rows[0];
+      
+      if (user.role !== 'super-admin') {
+        return res.status(403).json({ error: 'Access denied. Super-admin privileges required.' });
+      }
+
+      req.user.role = user.role;
+      next();
+    } catch (error) {
+      console.error('Super-admin authentication error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+};
+
+// Middleware to check if user is an editorial board member
+const authenticateEditorialBoard = (req, res, next) => {
+  authenticateToken(req, res, async () => {
+    try {
+      const result = await pool.query(
+        'SELECT role FROM users WHERE id = $1',
+        [req.user.userId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      const user = result.rows[0];
+      
+      if (user.role !== 'editorial-board' && user.role !== 'admin' && user.role !== 'super-admin') {
+        return res.status(403).json({ error: 'Access denied. Editorial board privileges required.' });
+      }
+
+      req.user.role = user.role;
+      next();
+    } catch (error) {
+      console.error('Editorial board authentication error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+};
+
+// Function to log admin actions
+const logAdminAction = async (adminId, action, targetType, targetId, details = null) => {
+  try {
+    await pool.query(
+      `INSERT INTO audit_log (admin_id, action, target_type, target_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [adminId, action, targetType, targetId, details]
+    );
+  } catch (error) {
+    console.error('Error logging admin action:', error);
+  }
+};
+
+// server.js - Update the validateSignup middleware
 const validateSignup = [
   body('email').notEmpty().withMessage('Email is required')
     .isEmail().normalizeEmail().withMessage('Please enter a valid email address'),
@@ -881,6 +975,7 @@ const validateSignup = [
   (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
+      // Return more detailed error information
       const errorMessages = errors.array().map(error => error.msg);
       return res.status(400).json({ 
         error: 'Validation failed', 
@@ -930,6 +1025,7 @@ app.post('/api/contact', async (req, res) => {
   try {
     const { name, email, phone, category, content } = req.body;
 
+    // Validate input
     if (!name || !name.trim()) {
       return res.status(400).json({ error: 'Name is required' });
     }
@@ -950,6 +1046,7 @@ app.post('/api/contact', async (req, res) => {
       return res.status(400).json({ error: 'Content is required' });
     }
 
+    // Insert into database
     const result = await pool.query(
       `INSERT INTO contact_messages (name, email, phone, category, content)
        VALUES ($1, $2, $3, $4, $5)
@@ -1012,11 +1109,13 @@ app.put('/api/admin/contacts/:id/status', authenticateSuperAdmin, async (req, re
     const { id } = req.params;
     const { status } = req.body;
 
+    // Validate status
     const validStatuses = ['waiting', 'in_progress', 'resolved'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
+    // Check if contact message exists
     const contactResult = await pool.query(
       'SELECT * FROM contact_messages WHERE id = $1',
       [id]
@@ -1026,6 +1125,7 @@ app.put('/api/admin/contacts/:id/status', authenticateSuperAdmin, async (req, re
       return res.status(404).json({ error: 'Contact message not found' });
     }
 
+    // Update status
     await pool.query(
       'UPDATE contact_messages SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
       [status, id]
@@ -1043,6 +1143,7 @@ app.delete('/api/admin/contacts/:id', authenticateSuperAdmin, async (req, res) =
   try {
     const { id } = req.params;
 
+    // Check if contact message exists
     const contactResult = await pool.query(
       'SELECT * FROM contact_messages WHERE id = $1',
       [id]
@@ -1052,6 +1153,7 @@ app.delete('/api/admin/contacts/:id', authenticateSuperAdmin, async (req, res) =
       return res.status(404).json({ error: 'Contact message not found' });
     }
 
+    // Delete contact message
     await pool.query('DELETE FROM contact_messages WHERE id = $1', [id]);
 
     res.json({ message: 'Contact message deleted successfully' });
@@ -1068,6 +1170,7 @@ app.post('/api/articles/:id/report', authenticateToken, async (req, res) => {
     const { reason } = req.body;
     const userId = req.user.userId;
 
+    // Check if article exists
     const articleResult = await pool.query(
       'SELECT * FROM articles WHERE id = $1',
       [id]
@@ -1077,6 +1180,7 @@ app.post('/api/articles/:id/report', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Article not found' });
     }
 
+    // Check if user has already reported this article
     const existingReport = await pool.query(
       'SELECT id FROM reported_articles WHERE article_id = $1 AND user_id = $2',
       [id, userId]
@@ -1086,6 +1190,7 @@ app.post('/api/articles/:id/report', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'You have already reported this article' });
     }
 
+    // Create report
     const result = await pool.query(
       `INSERT INTO reported_articles (article_id, user_id, reason)
        VALUES ($1, $2, $3)
@@ -1143,11 +1248,13 @@ app.put('/api/admin/reported-articles/:id/status', authenticateAdmin, async (req
     const { id } = req.params;
     const { status } = req.body;
 
+    // Validate status
     const validStatuses = ['pending', 'reviewed', 'resolved', 'dismissed'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
+    // Check if report exists
     const reportResult = await pool.query(
       'SELECT * FROM reported_articles WHERE id = $1',
       [id]
@@ -1157,6 +1264,7 @@ app.put('/api/admin/reported-articles/:id/status', authenticateAdmin, async (req
       return res.status(404).json({ error: 'Report not found' });
     }
 
+    // Update status
     await pool.query(
       'UPDATE reported_articles SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
       [status, id]
@@ -1174,6 +1282,7 @@ app.delete('/api/admin/articles/:id/delete', authenticateAdmin, async (req, res)
   try {
     const { id } = req.params;
 
+    // Get article data before deletion for logging
     const articleResult = await pool.query(
       `SELECT a.*, u.display_name as author_name 
        FROM articles a
@@ -1188,8 +1297,10 @@ app.delete('/api/admin/articles/:id/delete', authenticateAdmin, async (req, res)
     
     const article = articleResult.rows[0];
     
+    // Delete article
     await pool.query('DELETE FROM articles WHERE id = $1', [id]);
     
+    // Log the action
     await logAdminAction(
       req.user.userId,
       'delete_reported',
@@ -1215,6 +1326,7 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
       return res.status(400).json({ error: 'Reason is required' });
     }
 
+    // Check if user exists
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1',
       [userId]
@@ -1226,16 +1338,19 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
 
     const user = userResult.rows[0];
 
+    // Don't allow warnings for deleted accounts
     if (user.account_status === 'soft_deleted' || user.account_status === 'hard_deleted') {
       return res.status(400).json({ error: 'Cannot warn a deleted account' });
     }
 
+    // Add the warning
     await pool.query(
       `INSERT INTO user_warnings (user_id, reason, admin_id)
        VALUES ($1, $2, $3)`,
       [userId, reason, req.user.userId]
     );
 
+    // Count warnings for this user
     const warningCountResult = await pool.query(
       'SELECT COUNT(*) as count FROM user_warnings WHERE user_id = $1',
       [userId]
@@ -1243,6 +1358,7 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
 
     const warningCount = parseInt(warningCountResult.rows[0].count);
 
+    // If user has 3 warnings, mark for deletion
     if (warningCount >= 3) {
       await pool.query(
         `UPDATE users 
@@ -1253,6 +1369,7 @@ app.post('/api/admin/users/:userId/warnings', authenticateAdmin, async (req, res
         [userId]
       );
 
+      // Log the action
       await logAdminAction(
         req.user.userId,
         'soft_delete',
@@ -1279,6 +1396,7 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
   try {
     const { userId, warningId } = req.params;
 
+    // Check if warning exists and belongs to user
     const warningResult = await pool.query(
       'SELECT * FROM user_warnings WHERE id = $1 AND user_id = $2',
       [warningId, userId]
@@ -1288,11 +1406,13 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
       return res.status(404).json({ error: 'Warning not found' });
     }
 
+    // Delete the warning
     await pool.query(
       'DELETE FROM user_warnings WHERE id = $1',
       [warningId]
     );
 
+    // Count remaining warnings
     const warningCountResult = await pool.query(
       'SELECT COUNT(*) as count FROM user_warnings WHERE user_id = $1',
       [userId]
@@ -1300,6 +1420,7 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
 
     const warningCount = parseInt(warningCountResult.rows[0].count);
 
+    // If user was soft deleted due to warnings and now has less than 3, reactivate
     if (warningCount < 3) {
       const userResult = await pool.query(
         'SELECT * FROM users WHERE id = $1',
@@ -1318,6 +1439,7 @@ app.delete('/api/admin/users/:userId/warnings/:warningId', authenticateAdmin, as
           [userId]
         );
 
+        // Log the action
         await logAdminAction(
           req.user.userId,
           'reactivate',
@@ -1371,6 +1493,7 @@ app.post('/api/admin/users/:userId/undo-delete', authenticateAdmin, async (req, 
   try {
     const { userId } = req.params;
 
+    // Check if user exists and is soft deleted
     const userResult = await pool.query(
       'SELECT * FROM users WHERE id = $1 AND account_status = $2',
       [userId, 'soft_deleted']
@@ -1382,6 +1505,7 @@ app.post('/api/admin/users/:userId/undo-delete', authenticateAdmin, async (req, 
 
     const user = userResult.rows[0];
 
+    // Reactivate the account
     await pool.query(
       `UPDATE users 
        SET account_status = 'active', 
@@ -1391,6 +1515,7 @@ app.post('/api/admin/users/:userId/undo-delete', authenticateAdmin, async (req, 
       [userId]
     );
 
+    // Log the action
     await logAdminAction(
       req.user.userId,
       'undo_delete',
@@ -1579,10 +1704,298 @@ app.delete('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
   }
 });
 
+// ============================================
+// INVITE CODE ROUTES
+// ============================================
+
+// Validate invite code (public route)
+app.get('/api/invite-codes/validate/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    
+    // Check if code exists and is active
+    const result = await pool.query(
+      'SELECT code, name, description FROM invite_codes WHERE code = $1 AND active = TRUE',
+      [code.toUpperCase()]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ valid: false, error: 'Invalid or inactive invite code' });
+    }
+    
+    res.json({ 
+      valid: true, 
+      code: result.rows[0].code,
+      name: result.rows[0].name,
+      description: result.rows[0].description
+    });
+  } catch (error) {
+    console.error('Validate invite code error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get all invite codes (admin only)
+app.get('/api/admin/invite-codes', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        ic.*,
+        u.display_name as created_by_name,
+        COUNT(DISTINCT us.id) as total_users
+      FROM invite_codes ic
+      LEFT JOIN users u ON ic.created_by = u.id
+      LEFT JOIN users us ON us.invite_code = ic.code
+      GROUP BY ic.id, u.display_name
+      ORDER BY ic.created_at DESC
+    `);
+    
+    res.json({ codes: result.rows });
+  } catch (error) {
+    console.error('Get invite codes error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get invite code leaderboard (admin only)
+app.get('/api/admin/invite-codes/leaderboard', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        ic.code,
+        ic.name,
+        ic.description,
+        ic.active,
+        COUNT(DISTINCT u.id) as user_count,
+        ic.created_at
+      FROM invite_codes ic
+      LEFT JOIN users u ON u.invite_code = ic.code
+      GROUP BY ic.id, ic.code, ic.name, ic.description, ic.active, ic.created_at
+      HAVING COUNT(DISTINCT u.id) > 0
+      ORDER BY user_count DESC, ic.created_at DESC
+    `);
+    
+    res.json({ leaderboard: result.rows });
+  } catch (error) {
+    console.error('Get invite code leaderboard error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get users by invite code (admin only)
+app.get('/api/admin/invite-codes/:code/users', authenticateAdmin, async (req, res) => {
+  try {
+    const { code } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        u.id,
+        u.display_name,
+        u.email,
+        u.tier,
+        u.role,
+        u.created_at,
+        u.urown_score
+      FROM users u
+      WHERE u.invite_code = $1
+      ORDER BY u.created_at DESC
+    `, [code.toUpperCase()]);
+    
+    res.json({ users: result.rows });
+  } catch (error) {
+    console.error('Get users by invite code error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create invite code (admin only)
+app.post('/api/admin/invite-codes', authenticateAdmin, async (req, res) => {
+  try {
+    const { code, name, description } = req.body;
+    const adminId = req.user.userId;
+    
+    // Validate input
+    if (!code || !name) {
+      return res.status(400).json({ error: 'Code and name are required' });
+    }
+    
+    // Validate code format (5 characters, alphanumeric)
+    if (!/^[A-Z0-9]{5}$/.test(code.toUpperCase())) {
+      return res.status(400).json({ error: 'Code must be exactly 5 alphanumeric characters' });
+    }
+    
+    // Check if code already exists
+    const existingCode = await pool.query(
+      'SELECT id FROM invite_codes WHERE code = $1',
+      [code.toUpperCase()]
+    );
+    
+    if (existingCode.rows.length > 0) {
+      return res.status(400).json({ error: 'This invite code already exists' });
+    }
+    
+    // Create invite code
+    const result = await pool.query(
+      `INSERT INTO invite_codes (code, name, description, created_by)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [code.toUpperCase(), name.trim(), description?.trim() || null, adminId]
+    );
+    
+    // Log action
+    await logAdminAction(
+      adminId,
+      'create',
+      'invite_code',
+      result.rows[0].id,
+      `Created invite code: ${code.toUpperCase()} (${name})`
+    );
+    
+    res.status(201).json({
+      message: 'Invite code created successfully',
+      code: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Create invite code error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update invite code (admin only)
+app.put('/api/admin/invite-codes/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description, active } = req.body;
+    
+    // Check if code exists
+    const codeCheck = await pool.query(
+      'SELECT * FROM invite_codes WHERE id = $1',
+      [id]
+    );
+    
+    if (codeCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Invite code not found' });
+    }
+    
+    // Update invite code
+    const result = await pool.query(
+      `UPDATE invite_codes 
+       SET name = COALESCE($1, name),
+           description = COALESCE($2, description),
+           active = COALESCE($3, active),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $4
+       RETURNING *`,
+      [name?.trim(), description?.trim(), active, id]
+    );
+    
+    // Log action
+    await logAdminAction(
+      req.user.userId,
+      'update',
+      'invite_code',
+      parseInt(id),
+      `Updated invite code: ${result.rows[0].code}`
+    );
+    
+    res.json({
+      message: 'Invite code updated successfully',
+      code: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Update invite code error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Toggle invite code active status (admin only)
+app.patch('/api/admin/invite-codes/:id/toggle', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const result = await pool.query(
+      `UPDATE invite_codes 
+       SET active = NOT active,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING *`,
+      [id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Invite code not found' });
+    }
+    
+    // Log action
+    await logAdminAction(
+      req.user.userId,
+      result.rows[0].active ? 'activate' : 'deactivate',
+      'invite_code',
+      parseInt(id),
+      `${result.rows[0].active ? 'Activated' : 'Deactivated'} invite code: ${result.rows[0].code}`
+    );
+    
+    res.json({
+      message: `Invite code ${result.rows[0].active ? 'activated' : 'deactivated'} successfully`,
+      code: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Toggle invite code error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete invite code (admin only)
+app.delete('/api/admin/invite-codes/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get code info before deletion
+    const codeResult = await pool.query(
+      'SELECT * FROM invite_codes WHERE id = $1',
+      [id]
+    );
+    
+    if (codeResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Invite code not found' });
+    }
+    
+    const code = codeResult.rows[0];
+    
+    // Check if any users are using this code
+    const userCount = await pool.query(
+      'SELECT COUNT(*) as count FROM users WHERE invite_code = $1',
+      [code.code]
+    );
+    
+    const count = parseInt(userCount.rows[0].count);
+    
+    // Delete invite code
+    await pool.query('DELETE FROM invite_codes WHERE id = $1', [id]);
+    
+    // Log action
+    await logAdminAction(
+      req.user.userId,
+      'delete',
+      'invite_code',
+      parseInt(id),
+      `Deleted invite code: ${code.code} (${code.name}) - ${count} users affected`
+    );
+    
+    res.json({ 
+      message: 'Invite code deleted successfully',
+      users_affected: count
+    });
+  } catch (error) {
+    console.error('Delete invite code error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Signup
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, phone, full_name, display_name, discord_username, date_of_birth, password, terms_agreed } = req.body;
+    const { email, phone, full_name, display_name, discord_username, date_of_birth, password, invite_code, terms_agreed } = req.body;
     
     // Manual validation for better error messages
     const errors = {};
@@ -1612,6 +2025,23 @@ app.post('/api/auth/signup', async (req, res) => {
     // Discord username validation (optional)
     if (discord_username && discord_username.trim().length > 0 && discord_username.trim().length < 2) {
       errors.discord_username = 'Discord username must be at least 2 characters';
+    }
+    
+    // Invite code validation (optional)
+    if (invite_code && invite_code.trim().length > 0) {
+      if (invite_code.trim().length !== 5) {
+        errors.invite_code = 'Invite code must be exactly 5 characters';
+      } else {
+        // Check if invite code exists and is active
+        const inviteCheck = await pool.query(
+          'SELECT id FROM invite_codes WHERE code = $1 AND active = TRUE',
+          [invite_code.toUpperCase()]
+        );
+        
+        if (inviteCheck.rows.length === 0) {
+          errors.invite_code = 'Invalid or inactive invite code';
+        }
+      }
     }
     
     // Date of birth validation
@@ -1672,12 +2102,22 @@ app.post('/api/auth/signup', async (req, res) => {
     const saltRounds = 12;
     const password_hash = await bcrypt.hash(password, saltRounds);
 
-    // Create user
+    // Create user with invite code
     const result = await pool.query(
-      `INSERT INTO users (email, phone, full_name, display_name, discord_username, date_of_birth, password_hash, terms_agreed)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, created_at`,
-      [email, phone || null, full_name || null, display_name, discord_username || null, date_of_birth, password_hash, terms_agreed]
+      `INSERT INTO users (email, phone, full_name, display_name, discord_username, date_of_birth, password_hash, invite_code, terms_agreed)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, invite_code, created_at`,
+      [
+        email, 
+        phone || null, 
+        full_name || null, 
+        display_name, 
+        discord_username || null, 
+        date_of_birth, 
+        password_hash, 
+        invite_code ? invite_code.toUpperCase() : null,
+        terms_agreed
+      ]
     );
 
     const user = result.rows[0];
@@ -1701,6 +2141,7 @@ app.post('/api/auth/signup', async (req, res) => {
         discord_username: user.discord_username,
         tier: user.tier,
         role: user.role,
+        invite_code: user.invite_code,
         created_at: user.created_at
       }
     });
@@ -1830,7 +2271,8 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
               weekly_articles_count, weekly_reset_date, 
               display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
               discord_username_updated_at, created_at, followers, urown_score,
-              ideology, ideology_details, ideology_public, ideology_updated_at
+              ideology, ideology_details, ideology_public, ideology_updated_at,
+              invite_code
        FROM users 
        WHERE id = $1`,
       [req.user.userId]
@@ -1954,82 +2396,82 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
       }
 
       // Check if phone is already in use by another user
-              if (phone) {
-          const phoneCheck = await pool.query(
-            'SELECT id FROM users WHERE phone = $1 AND id != $2',
-            [phone, userId]
-          );
+      if (phone) {
+        const phoneCheck = await pool.query(
+          'SELECT id FROM users WHERE phone = $1 AND id != $2',
+          [phone, userId]
+        );
 
-          if (phoneCheck.rows.length > 0) {
-            return res.status(400).json({ error: 'Phone number is already in use' });
-          }
+        if (phoneCheck.rows.length > 0) {
+          return res.status(400).json({ error: 'Phone number is already in use' });
         }
-
-        updates.push(`phone = $${queryIndex++}`);
-        values.push(phone || null);
-        updates.push(`phone_updated_at = $${queryIndex++}`);
-        values.push(now);
       }
 
-      // Check discord_username update
-      if (discord_username !== undefined && discord_username !== user.discord_username) {
-        const lastUpdate = user.discord_username_updated_at ? new Date(user.discord_username_updated_at) : null;
-        const daysSinceLastUpdate = lastUpdate ? Math.floor((now - lastUpdate) / (24 * 60 * 60 * 1000)) : 14;
-
-        if (daysSinceLastUpdate < 14) {
-          const daysLeft = 14 - daysSinceLastUpdate;
-          return res.status(400).json({ 
-            error: `You can change your Discord username again in ${daysLeft} day${daysLeft !== 1 ? 's' : ''}` 
-          });
-        }
-
-        // Check if discord username is already in use by another user
-        if (discord_username && discord_username.trim()) {
-          const discordCheck = await pool.query(
-            'SELECT id FROM users WHERE discord_username = $1 AND id != $2',
-            [discord_username.trim(), userId]
-          );
-
-          if (discordCheck.rows.length > 0) {
-            return res.status(400).json({ error: 'Discord username is already in use' });
-          }
-        }
-
-        updates.push(`discord_username = $${queryIndex++}`);
-        values.push(discord_username ? discord_username.trim() : null);
-        updates.push(`discord_username_updated_at = $${queryIndex++}`);
-        values.push(now);
-      }
-
-      if (updates.length === 0) {
-        return res.status(400).json({ error: 'No changes provided' });
-      }
-
-      // Add user ID to values
-      values.push(userId);
-
-      // Update the user
-      const updateQuery = `
-        UPDATE users 
-        SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP 
-        WHERE id = $${queryIndex}
-        RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, 
-                  display_name_updated_at, email_updated_at, phone_updated_at, 
-                  password_updated_at, discord_username_updated_at, created_at
-      `;
-
-      const result = await pool.query(updateQuery, values);
-      const updatedUser = result.rows[0];
-
-      res.json({
-        message: 'Profile updated successfully',
-        user: updatedUser
-      });
-
-    } catch (error) {
-      console.error('Update profile error:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      updates.push(`phone = $${queryIndex++}`);
+      values.push(phone || null);
+      updates.push(`phone_updated_at = $${queryIndex++}`);
+      values.push(now);
     }
+
+    // Check discord_username update
+    if (discord_username !== undefined && discord_username !== user.discord_username) {
+      const lastUpdate = user.discord_username_updated_at ? new Date(user.discord_username_updated_at) : null;
+      const daysSinceLastUpdate = lastUpdate ? Math.floor((now - lastUpdate) / (24 * 60 * 60 * 1000)) : 14;
+
+      if (daysSinceLastUpdate < 14) {
+        const daysLeft = 14 - daysSinceLastUpdate;
+        return res.status(400).json({ 
+          error: `You can change your Discord username again in ${daysLeft} day${daysLeft !== 1 ? 's' : ''}` 
+        });
+      }
+
+      // Check if discord username is already in use by another user
+      if (discord_username && discord_username.trim()) {
+        const discordCheck = await pool.query(
+          'SELECT id FROM users WHERE discord_username = $1 AND id != $2',
+          [discord_username.trim(), userId]
+        );
+
+        if (discordCheck.rows.length > 0) {
+          return res.status(400).json({ error: 'Discord username is already in use' });
+        }
+      }
+
+      updates.push(`discord_username = $${queryIndex++}`);
+      values.push(discord_username ? discord_username.trim() : null);
+      updates.push(`discord_username_updated_at = $${queryIndex++}`);
+      values.push(now);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No changes provided' });
+    }
+
+    // Add user ID to values
+    values.push(userId);
+
+    // Update the user
+    const updateQuery = `
+      UPDATE users 
+      SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP 
+      WHERE id = $${queryIndex}
+      RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, 
+                display_name_updated_at, email_updated_at, phone_updated_at, 
+                password_updated_at, discord_username_updated_at, created_at
+    `;
+
+    const result = await pool.query(updateQuery, values);
+    const updatedUser = result.rows[0];
+
+    res.json({
+      message: 'Profile updated successfully',
+      user: updatedUser
+    });
+
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Change password
@@ -2154,16 +2596,15 @@ app.get('/api/user/stats', authenticateToken, async (req, res) => {
     const publishedArticles = articles.filter(article => article.published).length;
     const draftArticles = articles.filter(article => !article.published).length;
     
-    // Calculate total article views
-    const totalArticleViews = articles.reduce((sum, article) => sum + (article.views || 0), 0);
+    // Calculate total views
+    const totalViews = articles.reduce((sum, article) => sum + (article.views || 0), 0);
     
     res.json({
       stats: {
         totalArticles: articles.length,
         publishedArticles,
         draftArticles,
-        articleViews: totalArticleViews,
-        totalViews: totalArticleViews
+        views: totalViews
       }
     });
   } catch (error) {
@@ -2751,7 +3192,8 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
     const result = await pool.query(
       `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.discord_username, u.tier, u.role, 
               u.weekly_articles_count, u.created_at, u.updated_at, u.urown_score,
-              ub.ban_end, ub.reason as ban_reason
+              ub.ban_end, ub.reason as ban_reason,
+              u.invite_code
        FROM users u
        LEFT JOIN user_bans ub ON u.id = ub.user_id AND ub.ban_end > CURRENT_TIMESTAMP
        WHERE u.account_status = 'active'
@@ -2773,7 +3215,8 @@ app.get('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
     const result = await pool.query(
       `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.discord_username, u.tier, u.role, 
               u.weekly_articles_count, u.created_at, u.updated_at, u.urown_score,
-              ub.ban_end, ub.reason as ban_reason
+              ub.ban_end, ub.reason as ban_reason,
+              u.invite_code
        FROM users u
        LEFT JOIN user_bans ub ON u.id = ub.user_id AND ub.ban_end > CURRENT_TIMESTAMP
        WHERE u.id = $1`,
@@ -3456,8 +3899,9 @@ app.get('/api/users/:display_name', async (req, res) => {
        ORDER BY a.created_at DESC`,
       [user.id]
     );
-
-    const totalArticleViews = articlesResult.rows.reduce((sum, article) => sum + (article.views || 0), 0);
+    
+    const totalViews = articlesResult.rows.reduce((sum, article) => sum + (article.views || 0), 0);
+    const totalArticles = articlesResult.rows.length;
     
     // Check authentication (if user is logged in)
     let isFollowing = false;
@@ -3513,9 +3957,8 @@ app.get('/api/users/:display_name', async (req, res) => {
       user: userResponse,
       articles: articlesResult.rows,
       stats: {
-        totalArticles: articlesResult.rows.length,
-        articleViews: totalArticleViews,
-        totalViews: totalArticleViews
+        totalArticles,
+        totalViews
       }
     });
   } catch (error) {
@@ -4234,6 +4677,7 @@ app.get('/api/redflagged', async (req, res) => {
     const { 
       company, 
       experienceType,
+      topicId,
       minRating, 
       maxRating,
       sort = 'recent', 
@@ -4246,10 +4690,13 @@ app.get('/api/redflagged', async (req, res) => {
         rf.*,
         COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
         COALESCE(u.tier, 'Guest') as author_tier,
+        rt.title as topic_title,
+        rt.description as topic_description,
         (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
         (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
       FROM redflagged_posts rf
       LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
+      LEFT JOIN redflagged_topics rt ON rf.topic_id = rt.id
       WHERE rf.published = true AND rf.flagged = false
     `;
     
@@ -4265,6 +4712,12 @@ app.get('/api/redflagged', async (req, res) => {
     if (experienceType) {
       query += ` AND rf.experience_type = $${paramIndex}`;
       params.push(experienceType);
+      paramIndex++;
+    }
+    
+    if (topicId) {
+      query += ` AND rf.topic_id = $${paramIndex}`;
+      params.push(parseInt(topicId));
       paramIndex++;
     }
     
@@ -4303,7 +4756,7 @@ app.get('/api/redflagged', async (req, res) => {
     
     const result = await pool.query(query, params);
     
-        // Get total count for pagination
+    // Get total count for pagination
     let countQuery = `
       SELECT COUNT(*) as total
       FROM redflagged_posts rf
@@ -4322,6 +4775,12 @@ app.get('/api/redflagged', async (req, res) => {
     if (experienceType) {
       countQuery += ` AND rf.experience_type = $${countIndex}`;
       countParams.push(experienceType);
+      countIndex++;
+    }
+    
+    if (topicId) {
+      countQuery += ` AND rf.topic_id = $${countIndex}`;
+      countParams.push(parseInt(topicId));
       countIndex++;
     }
     
@@ -4358,10 +4817,13 @@ app.get('/api/redflagged/:id', async (req, res) => {
         rf.*,
         COALESCE(u.display_name, rf.anonymous_username, 'Anonymous') as author_name,
         COALESCE(u.tier, 'Guest') as author_tier,
+        rt.title as topic_title,
+        rt.description as topic_description,
         (SELECT COUNT(*) FROM redflagged_reactions WHERE post_id = rf.id) as reaction_count,
         (SELECT COUNT(*) FROM redflagged_comments WHERE post_id = rf.id) as comment_count
       FROM redflagged_posts rf
       LEFT JOIN users u ON rf.user_id = u.id AND rf.is_anonymous = false
+      LEFT JOIN redflagged_topics rt ON rf.topic_id = rt.id
       WHERE rf.id = $1 AND rf.published = true
     `, [id]);
     
@@ -4512,7 +4974,7 @@ app.post('/api/redflagged', async (req, res) => {
         rating_fairness, rating_pay, rating_culture, rating_management,
         anonymous_username, is_anonymous
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING *`,
       [
         userId, 
@@ -4845,6 +5307,248 @@ app.delete('/api/admin/redflagged/:id', authenticateAdmin, async (req, res) => {
     res.json({ message: 'Post deleted successfully' });
   } catch (error) {
     console.error('Delete post error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
+// REDFLAGGED TOPICS ROUTES
+// ============================================
+
+// Get active topics (public route)
+app.get('/api/redflagged/topics/active', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT * FROM redflagged_topics
+      WHERE active = true
+      AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+      ORDER BY created_at DESC
+      LIMIT 10
+    `);
+    
+    res.json({ topics: result.rows });
+  } catch (error) {
+    console.error('Get active topics error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get all topics (admin/editorial only)
+app.get('/api/admin/redflagged/topics', authenticateEditorialBoard, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT rt.*, u.display_name as creator_name,
+             (SELECT COUNT(*) FROM redflagged_posts WHERE topic_id = rt.id) as post_count
+      FROM redflagged_topics rt
+      LEFT JOIN users u ON rt.created_by = u.id
+      ORDER BY rt.created_at DESC
+    `);
+    
+    res.json({ topics: result.rows });
+  } catch (error) {
+    console.error('Get all topics error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create topic (admin/editorial only)
+app.post('/api/admin/redflagged/topics', authenticateEditorialBoard, async (req, res) => {
+  try {
+    const { title, description, expires_at } = req.body;
+    const userId = req.user.userId;
+    
+    // Validate input
+    if (!title?.trim()) {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+    
+    if (!description?.trim()) {
+      return res.status(400).json({ error: 'Description is required' });
+    }
+    
+    // Check if there are already 10 active topics
+    const activeCountResult = await pool.query(
+      'SELECT COUNT(*) as count FROM redflagged_topics WHERE active = true'
+    );
+    
+    const activeCount = parseInt(activeCountResult.rows[0].count);
+    if (activeCount >= 10) {
+      return res.status(400).json({ 
+        error: 'Maximum of 10 active topics reached. Please deactivate or delete an existing topic.' 
+      });
+    }
+    
+    // Create topic
+    const result = await pool.query(
+      `INSERT INTO redflagged_topics (title, description, created_by, expires_at)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [title.trim(), description.trim(), userId, expires_at || null]
+    );
+    
+    // Log action
+    await logAdminAction(
+      userId,
+      'create',
+      'redflagged_topic',
+      result.rows[0].id,
+      `Created topic: ${title}`
+    );
+    
+    res.status(201).json({
+      message: 'Topic created successfully',
+      topic: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Create topic error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update topic (admin/editorial only)
+app.put('/api/admin/redflagged/topics/:id', authenticateEditorialBoard, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, description, expires_at } = req.body;
+    
+    // Validate input
+    if (!title?.trim()) {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+    
+    if (!description?.trim()) {
+      return res.status(400).json({ error: 'Description is required' });
+    }
+    
+    // Check if topic exists
+    const topicCheck = await pool.query(
+      'SELECT * FROM redflagged_topics WHERE id = $1',
+      [id]
+    );
+    
+    if (topicCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Topic not found' });
+    }
+    
+    // Update topic
+    const result = await pool.query(
+      `UPDATE redflagged_topics 
+       SET title = $1, description = $2, expires_at = $3
+       WHERE id = $4
+       RETURNING *`,
+      [title.trim(), description.trim(), expires_at || null, id]
+    );
+    
+    // Log action
+    await logAdminAction(
+      req.user.userId,
+      'update',
+      'redflagged_topic',
+      parseInt(id),
+      `Updated topic: ${title}`
+    );
+    
+    res.json({
+      message: 'Topic updated successfully',
+      topic: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Update topic error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Toggle topic active status (admin/editorial only)
+app.put('/api/admin/redflagged/topics/:id/toggle', authenticateEditorialBoard, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { active } = req.body;
+    
+    // If activating, check if we're at the limit
+    if (active) {
+      const activeCountResult = await pool.query(
+        'SELECT COUNT(*) as count FROM redflagged_topics WHERE active = true AND id != $1',
+        [id]
+      );
+      
+      const activeCount = parseInt(activeCountResult.rows[0].count);
+      if (activeCount >= 10) {
+        return res.status(400).json({ 
+          error: 'Maximum of 10 active topics reached. Please deactivate another topic first.' 
+        });
+      }
+    }
+    
+    // Update active status
+    await pool.query(
+      'UPDATE redflagged_topics SET active = $1 WHERE id = $2',
+      [active, id]
+    );
+    
+    // Log action
+    await logAdminAction(
+      req.user.userId,
+      active ? 'activate' : 'deactivate',
+      'redflagged_topic',
+      parseInt(id),
+      `${active ? 'Activated' : 'Deactivated'} topic`
+    );
+    
+    res.json({ message: 'Topic status updated successfully' });
+  } catch (error) {
+    console.error('Toggle topic error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete topic (admin/editorial only)
+app.delete('/api/admin/redflagged/topics/:id', authenticateEditorialBoard, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Check if topic exists
+    const topicCheck = await pool.query(
+      'SELECT * FROM redflagged_topics WHERE id = $1',
+      [id]
+    );
+    
+    if (topicCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Topic not found' });
+    }
+    
+    const topic = topicCheck.rows[0];
+    
+    // Check if there are posts using this topic
+    const postCountResult = await pool.query(
+      'SELECT COUNT(*) as count FROM redflagged_posts WHERE topic_id = $1',
+      [id]
+    );
+    
+    const postCount = parseInt(postCountResult.rows[0].count);
+    
+    if (postCount > 0) {
+      // Set topic_id to NULL for all posts using this topic
+      await pool.query(
+        'UPDATE redflagged_posts SET topic_id = NULL WHERE topic_id = $1',
+        [id]
+      );
+    }
+    
+    // Delete topic
+    await pool.query('DELETE FROM redflagged_topics WHERE id = $1', [id]);
+    
+    // Log action
+    await logAdminAction(
+      req.user.userId,
+      'delete',
+      'redflagged_topic',
+      parseInt(id),
+      `Deleted topic: ${topic.title} (${postCount} posts affected)`
+    );
+    
+    res.json({ message: 'Topic deleted successfully' });
+  } catch (error) {
+    console.error('Delete topic error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
