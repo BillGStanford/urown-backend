@@ -267,6 +267,20 @@ const initDatabase = async () => {
       console.log('Ideology columns may already exist:', error.message);
     }
 
+    // ============================================
+    // ADDED: About Me columns
+    // ============================================
+    try {
+      await pool.query(`
+        ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS about_me TEXT,
+        ADD COLUMN IF NOT EXISTS about_me_updated_at TIMESTAMP
+      `);
+      console.log('About me columns added to users table');
+    } catch (error) {
+      console.log('About me columns may already exist:', error.message);
+    }
+
     // Add UROWN Score columns to users table
     await pool.query(`
       ALTER TABLE users 
@@ -2272,7 +2286,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
               display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
               discord_username_updated_at, created_at, followers, urown_score,
               ideology, ideology_details, ideology_public, ideology_updated_at,
-              invite_code
+              invite_code, about_me, about_me_updated_at
        FROM users 
        WHERE id = $1`,
       [req.user.userId]
@@ -2613,6 +2627,75 @@ app.get('/api/user/stats', authenticateToken, async (req, res) => {
   }
 });
 
+// ============================================
+// ADDED: ABOUT ME ROUTES
+// ============================================
+
+// Get user's about me (public route)
+app.get('/api/users/:display_name/about', async (req, res) => {
+  try {
+    const { display_name } = req.params;
+    const decodedDisplayName = decodeURIComponent(display_name);
+    
+    const result = await pool.query(
+      `SELECT about_me, about_me_updated_at 
+       FROM users 
+       WHERE display_name = $1 AND account_status = 'active'`,
+      [decodedDisplayName]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json({
+      about_me: result.rows[0].about_me,
+      about_me_updated_at: result.rows[0].about_me_updated_at
+    });
+  } catch (error) {
+    console.error('Get about me error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update user's about me (authenticated route)
+app.put('/api/user/about', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { about_me } = req.body;
+
+    // Validate input
+    if (about_me && about_me.length > 500) {
+      return res.status(400).json({ error: 'About me must be 500 characters or less' });
+    }
+
+    // Update about me
+    const result = await pool.query(
+      `UPDATE users 
+       SET about_me = $1, 
+           about_me_updated_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING id, email, phone, full_name, display_name, discord_username, 
+                 tier, role, about_me, about_me_updated_at`,
+      [about_me ? about_me.trim() : null, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      message: 'About me updated successfully',
+      user: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error('Update about me error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Create new article
 app.post('/api/articles', authenticateToken, async (req, res) => {
   try {
@@ -2825,6 +2908,7 @@ app.get('/api/articles', async (req, res) => {
     } else {
       query += ` AND (
         a.debate_topic_id IS NULL 
+        OR       a.debate_topic_id IS NULL 
         OR a.is_debate_winner = true
         OR EXISTS (
           SELECT 1 FROM debate_topics dt 
@@ -3870,7 +3954,8 @@ app.get('/api/users/:display_name', async (req, res) => {
     // Get user info - include discord_username
     const userResult = await pool.query(
       `SELECT id, display_name, discord_username, tier, role, created_at, followers, urown_score,
-              ideology, ideology_details, ideology_public, ideology_updated_at
+              ideology, ideology_details, ideology_public, ideology_updated_at,
+              about_me, about_me_updated_at
        FROM users 
        WHERE display_name = $1 AND account_status = 'active'`,
       [decodedDisplayName]
@@ -3935,7 +4020,9 @@ app.get('/api/users/:display_name', async (req, res) => {
       created_at: user.created_at,
       followers: user.followers || 0,
       urown_score: user.urown_score || 0,
-      isFollowing
+      isFollowing,
+      about_me: user.about_me, // ADDED: Include about_me
+      about_me_updated_at: user.about_me_updated_at // ADDED: Include about_me_updated_at
     };
     
     // Add ideology fields if applicable
@@ -4974,7 +5061,7 @@ app.post('/api/redflagged', async (req, res) => {
         rating_fairness, rating_pay, rating_culture, rating_management,
         anonymous_username, is_anonymous
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       RETURNING *`,
       [
         userId, 
