@@ -17,26 +17,45 @@ const PORT = process.env.PORT || 5000;
 
 // Database connection
 let pool;
-if (process.env.DATABASE_URL) {
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { 
-      rejectUnauthorized: false,
-      sslmode: 'require'
+
+try {
+  if (process.env.DATABASE_URL) {
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { 
+        rejectUnauthorized: false,
+        sslmode: 'require'
+      },
+      // Add connection timeout and retry settings
+      connectionTimeoutMillis: 10000,
+      idleTimeoutMillis: 30000,
+    });
+  } else {
+    pool = new Pool({
+      host: process.env.DB_HOST,
+      port: process.env.DB_PORT,
+      database: process.env.DB_NAME,
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+      ssl: { 
+        rejectUnauthorized: false,
+        sslmode: 'require'
+      },
+      connectionTimeoutMillis: 10000,
+      idleTimeoutMillis: 30000,
+    });
+  }
+  
+  // Test the connection
+  pool.query('SELECT NOW()', (err, res) => {
+    if (err) {
+      console.error('Database connection error:', err);
+    } else {
+      console.log('Database connected successfully');
     }
   });
-} else {
-  pool = new Pool({
-    host: process.env.DB_HOST,
-    port: process.env.DB_PORT,
-    database: process.env.DB_NAME,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    ssl: { 
-      rejectUnauthorized: false,
-      sslmode: 'require'
-    }
-  });
+} catch (error) {
+  console.error('Failed to initialize database connection:', error);
 }
 
 // Middleware
