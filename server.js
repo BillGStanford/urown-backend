@@ -813,16 +813,27 @@ const authenticateToken = (req, res, next) => {
   const token = authHeader && authHeader.split(' ')[1];
 
   if (!token) {
+    console.log('No token provided in request');
     return res.status(401).json({ error: 'Access token required' });
   }
 
   jwt.verify(token, process.env.JWT_SECRET, async (err, user) => {
     if (err) {
+      console.error('JWT verification error:', err.message);
+      if (err.name === 'TokenExpiredError') {
+        return res.status(403).json({ error: 'Token has expired. Please log in again.' });
+      }
       return res.status(403).json({ error: 'Invalid or expired token' });
     }
     
+    // Validate that userId exists in the token
+    if (!user.userId) {
+      console.error('Token missing userId:', user);
+      return res.status(403).json({ error: 'Invalid token format' });
+    }
+    
     // Check if user is banned
-    try {
+        try {
       const banResult = await pool.query(
         'SELECT ban_end, reason FROM user_bans WHERE user_id = $1 AND ban_end > CURRENT_TIMESTAMP',
         [user.userId]
@@ -830,7 +841,6 @@ const authenticateToken = (req, res, next) => {
 
       if (banResult.rows.length > 0) {
         const ban = banResult.rows[0];
-        // Calculate remaining time in a human-readable format
         const banEnd = new Date(ban.ban_end);
         const now = new Date();
         const diffMs = banEnd - now;
@@ -853,7 +863,7 @@ const authenticateToken = (req, res, next) => {
       }
     } catch (error) {
       console.error('Error checking ban status:', error);
-      // Continue to next if there's an error checking ban
+      // Continue even if ban check fails
     }
 
     req.user = user;
@@ -2266,23 +2276,46 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
 // Get user profile
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
+    console.log('Fetching profile for user ID:', req.user.userId);
+    
+    // Check if database connection is alive
+    try {
+      await pool.query('SELECT 1');
+    } catch (dbError) {
+      console.error('Database connection error:', dbError);
+      return res.status(503).json({ 
+        error: 'Database connection failed. Please try again later.' 
+      });
+    }
+
     const result = await pool.query(
       `SELECT id, email, phone, full_name, display_name, discord_username, tier, role, 
               weekly_articles_count, weekly_reset_date, 
               display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
               discord_username_updated_at, created_at, followers, urown_score,
               ideology, ideology_details, ideology_public, ideology_updated_at,
-              invite_code
+              invite_code, account_status
        FROM users 
        WHERE id = $1`,
       [req.user.userId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      console.error('User not found in database:', req.user.userId);
+      return res.status(404).json({ 
+        error: 'User not found. Your account may have been deleted.' 
+      });
     }
 
     const user = result.rows[0];
+
+    // Check if account is deleted
+    if (user.account_status !== 'active') {
+      console.log('User account is not active:', user.account_status);
+      return res.status(401).json({ 
+        error: 'Your account has been deactivated or deleted.' 
+      });
+    }
 
     // Check if we need to reset weekly article count
     const now = new Date();
@@ -2297,11 +2330,26 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
       user.weekly_articles_count = 0;
     }
 
+    console.log('Profile fetched successfully for user:', user.display_name);
     res.json({ user });
 
   } catch (error) {
     console.error('Profile fetch error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Error stack:', error.stack);
+    console.error('User ID from token:', req.user?.userId);
+    
+    // Send detailed error in development, generic in production
+    if (process.env.NODE_ENV === 'development') {
+      res.status(500).json({ 
+        error: 'Internal server error',
+        details: error.message,
+        stack: error.stack
+      });
+    } else {
+      res.status(500).json({ 
+        error: 'Unable to fetch profile. Please try again later.' 
+      });
+    }
   }
 });
 
