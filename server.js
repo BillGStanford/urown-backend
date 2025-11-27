@@ -19,150 +19,73 @@ const PORT = process.env.PORT || 5000;
 // Database connection with retry logic
 let pool;
 const createPool = () => {
-  if (process.env.DATABASE_URL) {
-    // For Supabase, use connection pooling mode
-    const connectionString = process.env.DATABASE_URL;
-    
-    return new Pool({
-      connectionString: connectionString,
-      ssl: {
-        rejectUnauthorized: false
-      },
-      // Connection pool settings
-      max: 10, // Reduced from 20 for free tier
-      min: 2,
-      idleTimeoutMillis: 20000, // Reduced from 30000
-      connectionTimeoutMillis: 5000, // Reduced from 10000
-      // Important for Supabase
-      allowExitOnIdle: false,
-      // Add statement timeout
-      statement_timeout: 30000, // 30 seconds
-      // Add query timeout
-      query_timeout: 30000
-    });
-  } else {
-    return new Pool({
-      host: process.env.DB_HOST,
-      port: process.env.DB_PORT,
-      database: process.env.DB_NAME,
-      user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD,
-      ssl: {
-        rejectUnauthorized: false
-      },
-      max: 10,
-      min: 2,
-      idleTimeoutMillis: 20000,
-      connectionTimeoutMillis: 5000,
-      allowExitOnIdle: false
-    });
+  const config = {
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+      rejectUnauthorized: false
+    },
+    max: 10,
+    min: 2,
+    idleTimeoutMillis: 20000,
+    connectionTimeoutMillis: 5000,
+    allowExitOnIdle: false,
+    statement_timeout: 30000,
+    query_timeout: 30000
+  };
+
+  // If no DATABASE_URL, use individual params
+  if (!process.env.DATABASE_URL) {
+    delete config.connectionString;
+    config.host = process.env.DB_HOST;
+    config.port = process.env.DB_PORT;
+    config.database = process.env.DB_NAME;
+    config.user = process.env.DB_USER;
+    config.password = process.env.DB_PASSWORD;
   }
+
+  return new Pool(config);
 };
 
 pool = createPool();
 
-
 // Handle pool errors
-pool.on('error', (err, client) => {
-  console.error('Unexpected error on idle client', err);
-  // Try to reconnect
-  setTimeout(() => {
-    console.log('Attempting to recreate pool after error...');
-    pool = createPool();
-  }, 1000);
+pool.on('error', (err) => {
+  console.error('❌ Unexpected pool error:', err);
 });
 
-// Handle pool connection
-pool.on('connect', (client) => {
-  console.log('New client connected to database');
-});
-
-// Handle pool acquisition
-pool.on('acquire', (client) => {
-  console.log('Client acquired from pool');
-});
-
-// Handle pool removal
-pool.on('remove', (client) => {
-  console.log('Client removed from pool');
-});
-
+// Test connection and log result
 const testConnection = async () => {
-  let retries = 3;
-  while (retries > 0) {
+  for (let i = 0; i < 3; i++) {
     try {
-      const result = await pool.query('SELECT NOW() as now, version() as version');
-      console.log('✅ Database connected successfully');
-      console.log('📅 Server time:', result.rows[0].now);
-      console.log('🗄️  Database version:', result.rows[0].version.split(',')[0]);
+      const result = await pool.query('SELECT NOW() as now');
+      console.log('✅ Database connected at:', result.rows[0].now);
       return true;
     } catch (err) {
-      retries--;
-      console.error(`❌ Database connection attempt failed (${3 - retries}/3):`, err.message);
-      if (retries > 0) {
-        console.log(`⏳ Retrying in 2 seconds...`);
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
+      console.error(`❌ Connection attempt ${i + 1}/3 failed:`, err.message);
+      if (i < 2) await new Promise(r => setTimeout(r, 2000));
     }
   }
-  console.error('💥 Failed to connect to database after 3 attempts');
+  console.error('💥 Failed to connect after 3 attempts');
   return false;
 };
 
-// Run connection test
 testConnection();
 
-// Add connection retry wrapper for critical queries
+// Query wrapper with retry
 const queryWithRetry = async (queryText, params, maxRetries = 2) => {
-  let lastError;
-  
   for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const client = await pool.connect();
     try {
-      // Get a client from the pool
-      const client = await pool.connect();
-      try {
-        const result = await client.query(queryText, params);
-        return result;
-      } finally {
-        // Always release the client back to the pool
-        client.release();
-      }
+      const result = await client.query(queryText, params);
+      return result;
     } catch (error) {
-      lastError = error;
-      console.error(`Query attempt ${attempt + 1}/${maxRetries} failed:`, error.message);
-      console.error('Query:', queryText.substring(0, 100) + '...');
-      
-      // Check if it's a connection error
-      if (error.code === 'ECONNREFUSED' || 
-          error.code === 'ETIMEDOUT' || 
-          error.code === 'ENOTFOUND' ||
-          error.message?.includes('Connection terminated') ||
-          error.message?.includes('connection timeout')) {
-        
-        // Wait before retrying
-        if (attempt < maxRetries - 1) {
-          const delay = Math.min(1000 * Math.pow(2, attempt), 5000);
-          console.log(`⏳ Waiting ${delay}ms before retry...`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-          
-          // Try to recreate the pool if all connections are bad
-          if (attempt === maxRetries - 2) {
-            console.log('🔄 Recreating connection pool...');
-            await pool.end();
-            pool = createPool();
-            await new Promise(resolve => setTimeout(resolve, 1000));
-          }
-        }
-      } else {
-        // For non-connection errors, don't retry
-        throw error;
-      }
+      console.error(`Query attempt ${attempt + 1} failed:`, error.message);
+      if (attempt === maxRetries - 1) throw error;
+      await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+    } finally {
+      client.release();
     }
   }
-  
-  // If we get here, all retries failed
-  console.error('❌ All query retry attempts failed');
-  throw lastError;
 };
 
 // Middleware
@@ -2148,46 +2071,40 @@ app.delete('/api/admin/invite-codes/:id', authenticateAdmin, async (req, res) =>
 
 // Signup
 app.post('/api/auth/signup', async (req, res) => {
+  const client = await pool.connect();
   try {
     const { email, phone, full_name, display_name, discord_username, date_of_birth, password, invite_code, terms_agreed } = req.body;
     
-    // Manual validation for better error messages
+    // Manual validation
     const errors = {};
     
-    // Email validation
     if (!email) {
       errors.email = 'Email is required';
     } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       errors.email = 'Please enter a valid email address';
     }
     
-    // Phone validation (optional)
     if (phone && !/^\+?[1-9]\d{1,14}$/.test(phone.replace(/\s/g, ''))) {
       errors.phone = 'Please enter a valid phone number';
     }
     
-    // Full name validation (now optional)
     if (full_name && full_name.trim().length > 0 && full_name.trim().length < 2) {
       errors.full_name = 'Full name must be at least 2 characters';
     }
     
-    // Display name validation
     if (!display_name || display_name.trim().length < 2) {
       errors.display_name = 'Display name must be at least 2 characters';
     }
     
-    // Discord username validation (optional)
     if (discord_username && discord_username.trim().length > 0 && discord_username.trim().length < 2) {
       errors.discord_username = 'Discord username must be at least 2 characters';
     }
     
-    // Invite code validation (optional)
     if (invite_code && invite_code.trim().length > 0) {
       if (invite_code.trim().length !== 5) {
         errors.invite_code = 'Invite code must be exactly 5 characters';
       } else {
-        // Check if invite code exists and is active
-        const inviteCheck = await pool.query(
+        const inviteCheck = await client.query(
           'SELECT id FROM invite_codes WHERE code = $1 AND active = TRUE',
           [invite_code.toUpperCase()]
         );
@@ -2198,7 +2115,6 @@ app.post('/api/auth/signup', async (req, res) => {
       }
     }
     
-    // Date of birth validation
     if (!date_of_birth) {
       errors.date_of_birth = 'Date of birth is required';
     } else {
@@ -2210,19 +2126,16 @@ app.post('/api/auth/signup', async (req, res) => {
       }
     }
     
-    // Password validation
     if (!password || password.length < 8) {
       errors.password = 'Password must be at least 8 characters';
     } else if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(password)) {
       errors.password = 'Password must contain uppercase, lowercase, and number';
     }
     
-    // Terms validation
     if (terms_agreed !== true) {
       errors.terms_agreed = 'You must agree to the terms of service';
     }
     
-    // If there are validation errors, return them
     if (Object.keys(errors).length > 0) {
       return res.status(400).json({ 
         error: 'Validation failed', 
@@ -2230,8 +2143,8 @@ app.post('/api/auth/signup', async (req, res) => {
       });
     }
     
-    // Check if email or display name already exists
-    const existingUser = await pool.query(
+    // Check existing user
+    const existingUser = await client.query(
       'SELECT id FROM users WHERE email = $1 OR display_name = $2',
       [email, display_name]
     );
@@ -2240,9 +2153,9 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ error: 'Email or display name already exists' });
     }
 
-    // Check if Discord username is already in use (if provided)
+    // Check Discord username
     if (discord_username && discord_username.trim()) {
-      const existingDiscord = await pool.query(
+      const existingDiscord = await client.query(
         'SELECT id FROM users WHERE discord_username = $1',
         [discord_username.trim()]
       );
@@ -2256,8 +2169,8 @@ app.post('/api/auth/signup', async (req, res) => {
     const saltRounds = 12;
     const password_hash = await bcrypt.hash(password, saltRounds);
 
-    // Create user with invite code
-    const result = await pool.query(
+    // Create user
+    const result = await client.query(
       `INSERT INTO users (email, phone, full_name, display_name, discord_username, date_of_birth, password_hash, invite_code, terms_agreed)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, invite_code, created_at`,
@@ -2301,11 +2214,16 @@ app.post('/api/auth/signup', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Signup error:', error);
+    console.error('❌ Signup error:', error.message);
+    console.error('Error code:', error.code);
+    console.error('Error detail:', error.detail);
+    
     res.status(500).json({ 
       error: 'Internal server error', 
-      details: error.message || 'An unknown error occurred during registration' 
+      details: process.env.NODE_ENV === 'development' ? error.message : 'Registration failed. Please try again.'
     });
+  } finally {
+    client.release();
   }
 });
 
@@ -2419,9 +2337,9 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
 
 // Get user profile
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
   try {
-    // Use queryWithRetry for better reliability
-    const result = await queryWithRetry(
+    const result = await client.query(
       `SELECT id, email, phone, full_name, display_name, discord_username, tier, role, 
               weekly_articles_count, weekly_reset_date, 
               display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
@@ -2446,31 +2364,27 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
 
     if (daysSinceReset >= 7) {
       try {
-        await queryWithRetry(
+        await client.query(
           'UPDATE users SET weekly_articles_count = 0, weekly_reset_date = $1 WHERE id = $2',
           [now, user.id]
         );
         user.weekly_articles_count = 0;
       } catch (updateError) {
         console.error('Error resetting weekly count:', updateError);
-        // Continue anyway - this is not critical
       }
     }
 
     res.json({ user });
 
   } catch (error) {
-    console.error('Profile fetch error:', error);
-    console.error('Error details:', {
-      code: error.code,
-      message: error.message,
-      stack: error.stack
-    });
+    console.error('❌ Profile fetch error:', error.message);
+    console.error('Error code:', error.code);
+    console.error('Error detail:', error.detail);
     
-    // Return a more specific error
-    if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
+    if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT' || error.code === 'ENOTFOUND') {
       res.status(503).json({ 
-        error: 'Database temporarily unavailable. Please try again in a moment.' 
+        error: 'Database connection failed. Please try again.',
+        details: process.env.NODE_ENV === 'development' ? error.message : undefined
       });
     } else {
       res.status(500).json({ 
@@ -2478,6 +2392,8 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
         details: process.env.NODE_ENV === 'development' ? error.message : undefined
       });
     }
+  } finally {
+    client.release();
   }
 });
 
@@ -3178,7 +3094,7 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
       }
     }
 
-    // Check weekly limit only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
+        // Check weekly limit only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
     if (published && !currentlyPublished && !isCounterOpinion && !isDebateOpinion) {
       const userResult = await pool.query(
         'SELECT weekly_articles_count, tier FROM users WHERE id = $1',
