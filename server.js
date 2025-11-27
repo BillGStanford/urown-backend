@@ -23,13 +23,11 @@ let pool;
 const createPool = () => {
   const config = {
     connectionString: process.env.DATABASE_URL,
-    ssl: {
-      rejectUnauthorized: false
-    },
-    max: 10,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    max: 20,
     min: 2,
-    idleTimeoutMillis: 20000,
-    connectionTimeoutMillis: 5000,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
     allowExitOnIdle: false,
     statement_timeout: 30000,
     query_timeout: 30000
@@ -52,42 +50,77 @@ pool = createPool();
 
 // Handle pool errors
 pool.on('error', (err) => {
-  console.error('❌ Unexpected pool error:', err);
+  console.error('❌ Database pool error:', err);
+  console.error('❌ Attempting to recreate pool...');
+  setTimeout(() => {
+    pool = createPool();
+  }, 5000);
 });
 
 // Test connection and log result
 const testConnection = async () => {
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 5; i++) {
     try {
-      const result = await pool.query('SELECT NOW() as now');
-      console.log('✅ Database connected at:', result.rows[0].now);
-      return true;
+      const client = await pool.connect();
+      try {
+        const result = await client.query('SELECT NOW() as now');
+        console.log('✅ Database connected at:', result.rows[0].now);
+        return true;
+      } finally {
+        client.release();
+      }
     } catch (err) {
-      console.error(`❌ Connection attempt ${i + 1}/3 failed:`, err.message);
-      if (i < 2) await new Promise(r => setTimeout(r, 2000));
+      console.error(`❌ Connection attempt ${i + 1}/5 failed:`, err.message);
+      if (i < 4) {
+        await new Promise(r => setTimeout(r, 3000));
+      }
     }
   }
-  console.error('💥 Failed to connect after 3 attempts');
+  console.error('💥 Failed to connect after 5 attempts');
   return false;
 };
 
 testConnection();
 
+
 // Query wrapper with retry
-const queryWithRetry = async (queryText, params, maxRetries = 2) => {
+const queryWithRetry = async (queryText, params, maxRetries = 3) => {
+  let lastError;
+  
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    const client = await pool.connect();
+    let client;
     try {
+      client = await pool.connect();
       const result = await client.query(queryText, params);
       return result;
     } catch (error) {
-      console.error(`Query attempt ${attempt + 1} failed:`, error.message);
-      if (attempt === maxRetries - 1) throw error;
-      await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      lastError = error;
+      console.error(`Query attempt ${attempt + 1}/${maxRetries} failed:`, error.message);
+      
+      // Check if it's a connection error that warrants a retry
+      if (error.code === 'ECONNREFUSED' || 
+          error.code === 'ETIMEDOUT' || 
+          error.code === 'ENOTFOUND' ||
+          error.message?.includes('Connection terminated') ||
+          error.message?.includes('connection timeout')) {
+        
+        if (attempt < maxRetries - 1) {
+          const delay = Math.min(2000 * Math.pow(2, attempt), 10000);
+          console.log(`⏳ Waiting ${delay}ms before retry...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      } else {
+        // For non-connection errors, don't retry
+        throw error;
+      }
     } finally {
-      client.release();
+      if (client) {
+        client.release();
+      }
     }
   }
+  
+  throw lastError;
 };
 
 // END: This replaces up to line 82
@@ -2345,9 +2378,12 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
 // Search for: app.get('/api/user/profile'
 
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
-  const client = await pool.connect();
+  let client;
   try {
-    const result = await client.query(
+    console.log('🔍 Fetching user profile for user ID:', req.user.userId);
+    
+    // Use queryWithRetry for better reliability
+    const result = await queryWithRetry(
       `SELECT id, email, phone, full_name, display_name, discord_username, tier, role, 
               weekly_articles_count, weekly_reset_date, 
               display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
@@ -2356,14 +2392,17 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
               invite_code
        FROM users 
        WHERE id = $1`,
-      [req.user.userId]
+      [req.user.userId],
+      2 // retry once if needed
     );
 
     if (result.rows.length === 0) {
+      console.log('❌ User not found in database');
       return res.status(404).json({ error: 'User not found' });
     }
 
     const user = result.rows[0];
+    console.log('✅ User profile found:', user.display_name);
 
     // Check if we need to reset weekly article count
     const now = new Date();
@@ -2372,13 +2411,17 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
 
     if (daysSinceReset >= 7) {
       try {
-        await client.query(
+        console.log('🔄 Resetting weekly article count for user:', user.display_name);
+        await queryWithRetry(
           'UPDATE users SET weekly_articles_count = 0, weekly_reset_date = $1 WHERE id = $2',
-          [now, user.id]
+          [now, user.id],
+          2
         );
         user.weekly_articles_count = 0;
+        console.log('✅ Weekly count reset successfully');
       } catch (updateError) {
-        console.error('Error resetting weekly count:', updateError);
+        console.error('❌ Error resetting weekly count:', updateError);
+        // Continue anyway - this is not critical
       }
     }
 
@@ -2386,13 +2429,21 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
 
   } catch (error) {
     console.error('❌ Profile fetch error:', error.message);
-    console.error('Error code:', error.code);
-    console.error('Error detail:', error.detail);
+    console.error('Error details:', {
+      code: error.code,
+      message: error.message,
+      stack: error.stack
+    });
     
-    if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT' || error.code === 'ENOTFOUND') {
+    // Return a more specific error
+    if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
       res.status(503).json({ 
-        error: 'Database connection failed. Please try again.',
-        details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        error: 'Database temporarily unavailable. Please try again in a moment.' 
+      });
+    } else if (error.code === '23505') {
+      // Unique constraint violation
+      res.status(409).json({ 
+        error: 'Data conflict. Please try again.' 
       });
     } else {
       res.status(500).json({ 
@@ -2400,8 +2451,6 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
         details: process.env.NODE_ENV === 'development' ? error.message : undefined
       });
     }
-  } finally {
-    client.release();
   }
 });
 
@@ -5832,6 +5881,42 @@ setInterval(async () => {
 }, 60 * 60 * 1000); // Every hour
 
 // Add this catch-all route at very end, before error handling middleware
+
+// Enhanced health check endpoint
+app.get('/api/health/deep', async (req, res) => {
+  try {
+    // Test database connection with a simple query
+    const dbResult = await queryWithRetry('SELECT NOW() as current_time, version() as db_version', [], 1);
+    
+    // Check if users table is accessible
+    const usersCount = await queryWithRetry('SELECT COUNT(*) as user_count FROM users WHERE account_status = $1', ['active'], 1);
+    
+    res.json({ 
+      status: 'HEALTHY',
+      timestamp: new Date().toISOString(),
+      database: {
+        connected: true,
+        current_time: dbResult.rows[0].current_time,
+        db_version: dbResult.rows[0].db_version,
+        active_users: parseInt(usersCount.rows[0].user_count)
+      },
+      uptime: process.uptime(),
+      memory: process.memoryUsage()
+    });
+  } catch (error) {
+    console.error('❌ Deep health check failed:', error);
+    res.status(503).json({ 
+      status: 'UNHEALTHY',
+      timestamp: new Date().toISOString(),
+      database: {
+        connected: false,
+        error: error.message
+      },
+      uptime: process.uptime()
+    });
+  }
+});
+
 // This serves React app for any route that doesn't match API routes
 app.get('*', (req, res) => {
   if (fs.existsSync(buildPath)) {
