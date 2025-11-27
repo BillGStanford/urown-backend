@@ -16,6 +16,8 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// START: Replace from line 20 to line 82 in server.js
+
 // Database connection with retry logic
 let pool;
 const createPool = () => {
@@ -87,6 +89,8 @@ const queryWithRetry = async (queryText, params, maxRetries = 2) => {
     }
   }
 };
+
+// END: This replaces up to line 82
 
 // Middleware
 // More permissive CORS for production
@@ -2069,7 +2073,9 @@ app.delete('/api/admin/invite-codes/:id', authenticateAdmin, async (req, res) =>
   }
 });
 
-// Signup
+// REPLACE lines 1977-2167 in server.js
+// Search for: app.post('/api/auth/signup'
+
 app.post('/api/auth/signup', async (req, res) => {
   const client = await pool.connect();
   try {
@@ -2335,7 +2341,9 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
   }
 });
 
-// Get user profile
+// REPLACE lines 2752-2810 in server.js
+// Search for: app.get('/api/user/profile'
+
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -3094,7 +3102,7 @@ app.put('/api/articles/:id', authenticateToken, async (req, res) => {
       }
     }
 
-        // Check weekly limit only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
+    // Check weekly limit only if publishing for first time and it's an original article (not a counter opinion or debate opinion)
     if (published && !currentlyPublished && !isCounterOpinion && !isDebateOpinion) {
       const userResult = await pool.query(
         'SELECT weekly_articles_count, tier FROM users WHERE id = $1',
