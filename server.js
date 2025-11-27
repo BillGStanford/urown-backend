@@ -20,18 +20,25 @@ const PORT = process.env.PORT || 5000;
 let pool;
 const createPool = () => {
   if (process.env.DATABASE_URL) {
+    // For Supabase, use connection pooling mode
+    const connectionString = process.env.DATABASE_URL;
+    
     return new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: { 
-        rejectUnauthorized: false,
-        sslmode: 'require'
+      connectionString: connectionString,
+      ssl: {
+        rejectUnauthorized: false
       },
-      // Add these important settings:
-      max: 20, // Maximum number of clients in pool
-      idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
-      connectionTimeoutMillis: 10000, // Return error after 10 seconds if connection cannot be established
-      // Allow the pool to handle connection errors gracefully
-      allowExitOnIdle: false
+      // Connection pool settings
+      max: 10, // Reduced from 20 for free tier
+      min: 2,
+      idleTimeoutMillis: 20000, // Reduced from 30000
+      connectionTimeoutMillis: 5000, // Reduced from 10000
+      // Important for Supabase
+      allowExitOnIdle: false,
+      // Add statement timeout
+      statement_timeout: 30000, // 30 seconds
+      // Add query timeout
+      query_timeout: 30000
     });
   } else {
     return new Pool({
@@ -40,13 +47,13 @@ const createPool = () => {
       database: process.env.DB_NAME,
       user: process.env.DB_USER,
       password: process.env.DB_PASSWORD,
-      ssl: { 
-        rejectUnauthorized: false,
-        sslmode: 'require'
+      ssl: {
+        rejectUnauthorized: false
       },
-      max: 20,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
+      max: 10,
+      min: 2,
+      idleTimeoutMillis: 20000,
+      connectionTimeoutMillis: 5000,
       allowExitOnIdle: false
     });
   }
@@ -54,43 +61,107 @@ const createPool = () => {
 
 pool = createPool();
 
+
 // Handle pool errors
 pool.on('error', (err, client) => {
   console.error('Unexpected error on idle client', err);
-  // Don't exit the process, just log the error
+  // Try to reconnect
+  setTimeout(() => {
+    console.log('Attempting to recreate pool after error...');
+    pool = createPool();
+  }, 1000);
 });
 
-// Test database connection on startup
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error('Database connection error on startup:', err);
-  } else {
-    console.log('Database connected successfully at:', res.rows[0].now);
-  }
+// Handle pool connection
+pool.on('connect', (client) => {
+  console.log('New client connected to database');
 });
+
+// Handle pool acquisition
+pool.on('acquire', (client) => {
+  console.log('Client acquired from pool');
+});
+
+// Handle pool removal
+pool.on('remove', (client) => {
+  console.log('Client removed from pool');
+});
+
+const testConnection = async () => {
+  let retries = 3;
+  while (retries > 0) {
+    try {
+      const result = await pool.query('SELECT NOW() as now, version() as version');
+      console.log('✅ Database connected successfully');
+      console.log('📅 Server time:', result.rows[0].now);
+      console.log('🗄️  Database version:', result.rows[0].version.split(',')[0]);
+      return true;
+    } catch (err) {
+      retries--;
+      console.error(`❌ Database connection attempt failed (${3 - retries}/3):`, err.message);
+      if (retries > 0) {
+        console.log(`⏳ Retrying in 2 seconds...`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+  }
+  console.error('💥 Failed to connect to database after 3 attempts');
+  return false;
+};
+
+// Run connection test
+testConnection();
 
 // Add connection retry wrapper for critical queries
-const queryWithRetry = async (queryText, params, maxRetries = 3) => {
+const queryWithRetry = async (queryText, params, maxRetries = 2) => {
   let lastError;
   
-  for (let i = 0; i < maxRetries; i++) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      const result = await pool.query(queryText, params);
-      return result;
+      // Get a client from the pool
+      const client = await pool.connect();
+      try {
+        const result = await client.query(queryText, params);
+        return result;
+      } finally {
+        // Always release the client back to the pool
+        client.release();
+      }
     } catch (error) {
       lastError = error;
-      console.error(`Query attempt ${i + 1} failed:`, error.message);
+      console.error(`Query attempt ${attempt + 1}/${maxRetries} failed:`, error.message);
+      console.error('Query:', queryText.substring(0, 100) + '...');
       
-      // If it's a connection error, wait before retrying
-      if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
-        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+      // Check if it's a connection error
+      if (error.code === 'ECONNREFUSED' || 
+          error.code === 'ETIMEDOUT' || 
+          error.code === 'ENOTFOUND' ||
+          error.message?.includes('Connection terminated') ||
+          error.message?.includes('connection timeout')) {
+        
+        // Wait before retrying
+        if (attempt < maxRetries - 1) {
+          const delay = Math.min(1000 * Math.pow(2, attempt), 5000);
+          console.log(`⏳ Waiting ${delay}ms before retry...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          
+          // Try to recreate the pool if all connections are bad
+          if (attempt === maxRetries - 2) {
+            console.log('🔄 Recreating connection pool...');
+            await pool.end();
+            pool = createPool();
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
       } else {
-        // For other errors, don't retry
+        // For non-connection errors, don't retry
         throw error;
       }
     }
   }
   
+  // If we get here, all retries failed
+  console.error('❌ All query retry attempts failed');
   throw lastError;
 };
 
