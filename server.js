@@ -15,67 +15,29 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ============================================
-// IMPROVED DATABASE CONNECTION WITH RETRY LOGIC
-// ============================================
-
-// Database connection with retry logic
+// Database connection
 let pool;
-const initializePool = async (retries = 5, delay = 5000) => {
-  for (let i = 0; i < retries; i++) {
-    try {
-      if (process.env.DATABASE_URL) {
-        pool = new Pool({
-          connectionString: process.env.DATABASE_URL,
-          ssl: { 
-            rejectUnauthorized: false,
-            sslmode: 'require'
-          },
-          // Add connection pool settings
-          max: 20, // maximum number of clients
-          idleTimeoutMillis: 30000,
-          connectionTimeoutMillis: 10000,
-        });
-      } else {
-        pool = new Pool({
-          host: process.env.DB_HOST,
-          port: process.env.DB_PORT,
-          database: process.env.DB_NAME,
-          user: process.env.DB_USER,
-          password: process.env.DB_PASSWORD,
-          ssl: { 
-            rejectUnauthorized: false,
-            sslmode: 'require'
-          },
-          max: 20,
-          idleTimeoutMillis: 30000,
-          connectionTimeoutMillis: 10000,
-        });
-      }
-
-      // Test the connection
-      await pool.query('SELECT NOW()');
-      console.log('Database connection established successfully');
-      return pool;
-    } catch (error) {
-      console.error(`Database connection attempt ${i + 1} failed:`, error.message);
-      if (i === retries - 1) {
-        throw new Error('Failed to connect to database after multiple attempts');
-      }
-      await new Promise(resolve => setTimeout(resolve, delay));
+if (process.env.DATABASE_URL) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { 
+      rejectUnauthorized: false,
+      sslmode: 'require'
     }
-  }
-};
-
-// Initialize pool before starting server
-(async () => {
-  try {
-    await initializePool();
-  } catch (error) {
-    console.error('Fatal: Could not establish database connection:', error);
-    process.exit(1);
-  }
-})();
+  });
+} else {
+  pool = new Pool({
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    database: process.env.DB_NAME,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    ssl: { 
+      rejectUnauthorized: false,
+      sslmode: 'require'
+    }
+  });
+}
 
 // Middleware
 // More permissive CORS for production
@@ -303,20 +265,6 @@ const initDatabase = async () => {
       console.log('Ideology columns added to users table');
     } catch (error) {
       console.log('Ideology columns may already exist:', error.message);
-    }
-
-    // ============================================
-    // ADDED: About Me columns
-    // ============================================
-    try {
-      await pool.query(`
-        ALTER TABLE users 
-        ADD COLUMN IF NOT EXISTS about_me TEXT,
-        ADD COLUMN IF NOT EXISTS about_me_updated_at TIMESTAMP
-      `);
-      console.log('About me columns added to users table');
-    } catch (error) {
-      console.log('About me columns may already exist:', error.message);
     }
 
     // Add UROWN Score columns to users table
@@ -859,64 +807,30 @@ const awardPoints = async (userId, activityType, points, referenceId = null, ref
   }
 };
 
-// ============================================
-// IMPROVED JWT MIDDLEWARE
-// ============================================
+// JWT middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
 
-const authenticateToken = async (req, res, next) => {
-  try {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
 
-    if (!token) {
-      return res.status(401).json({ error: 'Access token required' });
-    }
-
-    // Verify JWT token
-    let decoded;
-    try {
-      decoded = jwt.verify(token, process.env.JWT_SECRET);
-    } catch (jwtError) {
-      console.error('JWT verification error:', jwtError.message);
+  jwt.verify(token, process.env.JWT_SECRET, async (err, user) => {
+    if (err) {
       return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-
-    // Check if user exists in database
-    let userResult;
-    try {
-      userResult = await pool.query(
-        'SELECT id, email, account_status FROM users WHERE id = $1',
-        [decoded.userId]
-      );
-    } catch (dbError) {
-      console.error('Database error in authenticateToken:', dbError);
-      return res.status(500).json({ error: 'Database error. Please try again.' });
-    }
-
-    if (userResult.rows.length === 0) {
-      return res.status(401).json({ 
-        error: 'User not found. Your session may have expired. Please log in again.' 
-      });
-    }
-
-    const user = userResult.rows[0];
-
-    // Check if account is deleted
-    if (user.account_status === 'soft_deleted' || user.account_status === 'hard_deleted') {
-      return res.status(401).json({ 
-        error: 'Your account has been deleted. Please contact support if you believe this is an error.' 
-      });
     }
     
     // Check if user is banned
     try {
       const banResult = await pool.query(
         'SELECT ban_end, reason FROM user_bans WHERE user_id = $1 AND ban_end > CURRENT_TIMESTAMP',
-        [decoded.userId]
+        [user.userId]
       );
 
       if (banResult.rows.length > 0) {
         const ban = banResult.rows[0];
+        // Calculate remaining time in a human-readable format
         const banEnd = new Date(ban.ban_end);
         const now = new Date();
         const diffMs = banEnd - now;
@@ -934,20 +848,17 @@ const authenticateToken = async (req, res, next) => {
         }
 
         return res.status(401).json({ 
-          error: `Your account has been banned. Reason: "${ban.reason}". The ban will expire in ${timeLeft}. If you disagree contact us at nilecommun@gmail.com` 
+          error: `Your account has been banned. Reason: "${ban.reason}." The ban will expire in ${timeLeft}. If you disagree contact us at, nilecommun@gmail.com` 
         });
       }
-    } catch (banError) {
-      console.error('Error checking ban status:', banError);
-      // Continue even if ban check fails - we don't want to block legitimate users
+    } catch (error) {
+      console.error('Error checking ban status:', error);
+      // Continue to next if there's an error checking ban
     }
 
-    req.user = decoded;
+    req.user = user;
     next();
-  } catch (error) {
-    console.error('Unexpected error in authenticateToken:', error);
-    return res.status(500).json({ error: 'Internal server error during authentication' });
-  }
+  });
 };
 
 // Middleware to check if user is an admin
@@ -2352,70 +2263,45 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
   }
 });
 
-// ============================================
-// IMPROVED USER PROFILE ROUTE
-// ============================================
-
+// Get user profile
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.userId;
-    
-    // Query with error handling
-    let result;
-    try {
-      result = await pool.query(
-        `SELECT id, email, phone, full_name, display_name, discord_username, tier, role, 
-                weekly_articles_count, weekly_reset_date, 
-                display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
-                discord_username_updated_at, created_at, followers, urown_score,
-                ideology, ideology_details, ideology_public, ideology_updated_at,
-                invite_code, about_me, about_me_updated_at
-         FROM users 
-         WHERE id = $1 AND account_status = 'active'`,
-        [userId]
-      );
-    } catch (dbError) {
-      console.error('Database error fetching user profile:', dbError);
-      return res.status(500).json({ 
-        error: 'Database error while fetching profile',
-        details: process.env.NODE_ENV === 'development' ? dbError.message : undefined
-      });
-    }
+    const result = await pool.query(
+      `SELECT id, email, phone, full_name, display_name, discord_username, tier, role, 
+              weekly_articles_count, weekly_reset_date, 
+              display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
+              discord_username_updated_at, created_at, followers, urown_score,
+              ideology, ideology_details, ideology_public, ideology_updated_at,
+              invite_code
+       FROM users 
+       WHERE id = $1`,
+      [req.user.userId]
+    );
 
     if (result.rows.length === 0) {
-      console.error(`User profile not found for userId: ${userId}`);
       return res.status(404).json({ error: 'User not found' });
     }
 
     const user = result.rows[0];
 
     // Check if we need to reset weekly article count
-    try {
-      const now = new Date();
-      const resetDate = new Date(user.weekly_reset_date);
-      const daysSinceReset = Math.floor((now - resetDate) / (24 * 60 * 60 * 1000));
+    const now = new Date();
+    const resetDate = new Date(user.weekly_reset_date);
+    const daysSinceReset = Math.floor((now - resetDate) / (24 * 60 * 60 * 1000));
 
-      if (daysSinceReset >= 7) {
-        await pool.query(
-          'UPDATE users SET weekly_articles_count = 0, weekly_reset_date = $1 WHERE id = $2',
-          [now, user.id]
-        );
-        user.weekly_articles_count = 0;
-        user.weekly_reset_date = now;
-      }
-    } catch (resetError) {
-      console.error('Error resetting weekly count:', resetError);
-      // Don't fail the request if reset fails
+    if (daysSinceReset >= 7) {
+      await pool.query(
+        'UPDATE users SET weekly_articles_count = 0, weekly_reset_date = $1 WHERE id = $2',
+        [now, user.id]
+      );
+      user.weekly_articles_count = 0;
     }
 
     res.json({ user });
 
   } catch (error) {
-    console.error('Unexpected error in profile fetch:', error);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+    console.error('Profile fetch error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2727,73 +2613,6 @@ app.get('/api/user/stats', authenticateToken, async (req, res) => {
   }
 });
 
-// ============================================
-// ADDED: ABOUT ME ROUTES
-// ============================================
-
-// Get user's about me (public route)
-app.get('/api/users/:display_name/about', async (req, res) => {
-  try {
-    const { display_name } = req.params;
-    const decodedDisplayName = decodeURIComponent(display_name);
-    
-    const result = await pool.query(
-      `SELECT about_me, about_me_updated_at 
-       FROM users 
-       WHERE display_name = $1 AND account_status = 'active'`,
-      [decodedDisplayName]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    res.json({
-      about_me: result.rows[0].about_me,
-      about_me_updated_at: result.rows[0].about_me_updated_at
-    });
-  } catch (error) {
-    console.error('Get about me error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update user's about me (authenticated route)
-app.put('/api/user/about', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { about_me } = req.body;
-
-    // Validate input
-    if (about_me && about_me.length > 500) {
-      return res.status(400).json({ error: 'About me must be 500 characters or less' });
-    }
-
-    // Update about me
-    const result = await pool.query(
-      `UPDATE users 
-       SET about_me = $1, 
-           about_me_updated_at = CURRENT_TIMESTAMP,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2       RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, about_me, about_me_updated_at`,
-      [about_me ? about_me.trim() : null, userId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    res.json({
-      message: 'About me updated successfully',
-      user: result.rows[0]
-    });
-
-  } catch (error) {
-    console.error('Update about me error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
 // Create new article
 app.post('/api/articles', authenticateToken, async (req, res) => {
   try {
@@ -3006,7 +2825,6 @@ app.get('/api/articles', async (req, res) => {
     } else {
       query += ` AND (
         a.debate_topic_id IS NULL 
-        OR       a.debate_topic_id IS NULL 
         OR a.is_debate_winner = true
         OR EXISTS (
           SELECT 1 FROM debate_topics dt 
@@ -4052,8 +3870,7 @@ app.get('/api/users/:display_name', async (req, res) => {
     // Get user info - include discord_username
     const userResult = await pool.query(
       `SELECT id, display_name, discord_username, tier, role, created_at, followers, urown_score,
-              ideology, ideology_details, ideology_public, ideology_updated_at,
-              about_me, about_me_updated_at
+              ideology, ideology_details, ideology_public, ideology_updated_at
        FROM users 
        WHERE display_name = $1 AND account_status = 'active'`,
       [decodedDisplayName]
@@ -4118,9 +3935,7 @@ app.get('/api/users/:display_name', async (req, res) => {
       created_at: user.created_at,
       followers: user.followers || 0,
       urown_score: user.urown_score || 0,
-      isFollowing,
-      about_me: user.about_me, // ADDED: Include about_me
-      about_me_updated_at: user.about_me_updated_at // ADDED: Include about_me_updated_at
+      isFollowing
     };
     
     // Add ideology fields if applicable
@@ -5159,7 +4974,7 @@ app.post('/api/redflagged', async (req, res) => {
         rating_fairness, rating_pay, rating_culture, rating_management,
         anonymous_username, is_anonymous
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING *`,
       [
         userId, 
@@ -5649,7 +5464,7 @@ app.put('/api/admin/redflagged/topics/:id/toggle', authenticateEditorialBoard, a
     const { id } = req.params;
     const { active } = req.body;
     
-    // If activating, check if we're at limit
+    // If activating, check if we're at the limit
     if (active) {
       const activeCountResult = await pool.query(
         'SELECT COUNT(*) as count FROM redflagged_topics WHERE active = true AND id != $1',
@@ -5956,64 +5771,18 @@ setInterval(async () => {
   }
 }, 60000); // Run every minute
 
-// ============================================
-// IMPROVED SERVER STARTUP
-// ============================================
-
-const startServer = async () => {
+// Start server
+app.listen(PORT, async () => {
+  console.log(`Server running on port ${PORT}`);
   try {
-    // Ensure database pool is initialized
-    if (!pool) {
-      console.log('Initializing database pool...');
-      await initializePool();
-    }
-
-    // Initialize database tables
-    console.log('Initializing database tables...');
+    console.log('Initializing database...');
     await initDatabase();
-    console.log('Database initialization complete.');
-
-    // Start listening
-    app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-      console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-      console.log('Server is ready to accept connections.');
-    });
+    console.log('Database initialization complete. Server is ready.');
   } catch (error) {
-    console.error('Failed to start server:', error);
-    process.exit(1);
+    console.error('Failed to initialize database:', error);
+    // Continue running even if database initialization fails
+    // The tables might already exist
   }
-};
-
-// Handle unhandled rejections
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
-
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
-  process.exit(1);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully...');
-  if (pool) {
-    await pool.end();
-  }
-  process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-  console.log('SIGINT received, shutting down gracefully...');
-  if (pool) {
-    await pool.end();
-  }
-  process.exit(0);
-});
-
-// Start the server
-startServer();
 
 module.exports = app;
