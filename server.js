@@ -11,33 +11,88 @@ const session = require('express-session');
 const PgSession = require('connect-pg-simple')(session);
 const path = require('path');
 const fs = require('fs');
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Database connection
+// Database connection with retry logic
 let pool;
-if (process.env.DATABASE_URL) {
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { 
-      rejectUnauthorized: false,
-      sslmode: 'require'
+const createPool = () => {
+  if (process.env.DATABASE_URL) {
+    return new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { 
+        rejectUnauthorized: false,
+        sslmode: 'require'
+      },
+      // Add these important settings:
+      max: 20, // Maximum number of clients in pool
+      idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
+      connectionTimeoutMillis: 10000, // Return error after 10 seconds if connection cannot be established
+      // Allow the pool to handle connection errors gracefully
+      allowExitOnIdle: false
+    });
+  } else {
+    return new Pool({
+      host: process.env.DB_HOST,
+      port: process.env.DB_PORT,
+      database: process.env.DB_NAME,
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+      ssl: { 
+        rejectUnauthorized: false,
+        sslmode: 'require'
+      },
+      max: 20,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+      allowExitOnIdle: false
+    });
+  }
+};
+
+pool = createPool();
+
+// Handle pool errors
+pool.on('error', (err, client) => {
+  console.error('Unexpected error on idle client', err);
+  // Don't exit the process, just log the error
+});
+
+// Test database connection on startup
+pool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('Database connection error on startup:', err);
+  } else {
+    console.log('Database connected successfully at:', res.rows[0].now);
+  }
+});
+
+// Add connection retry wrapper for critical queries
+const queryWithRetry = async (queryText, params, maxRetries = 3) => {
+  let lastError;
+  
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const result = await pool.query(queryText, params);
+      return result;
+    } catch (error) {
+      lastError = error;
+      console.error(`Query attempt ${i + 1} failed:`, error.message);
+      
+      // If it's a connection error, wait before retrying
+      if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
+        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+      } else {
+        // For other errors, don't retry
+        throw error;
+      }
     }
-  });
-} else {
-  pool = new Pool({
-    host: process.env.DB_HOST,
-    port: process.env.DB_PORT,
-    database: process.env.DB_NAME,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    ssl: { 
-      rejectUnauthorized: false,
-      sslmode: 'require'
-    }
-  });
-}
+  }
+  
+  throw lastError;
+};
 
 // Middleware
 // More permissive CORS for production
@@ -999,15 +1054,43 @@ const validateLogin = [
 ];
 
 // Routes
+// Health check endpoint that's more robust
 app.get('/api/health', async (req, res) => {
   try {
-    await pool.query('SELECT NOW()');
-    res.json({ status: 'OK', message: 'UROWN API is running and database connection is working' });
+    // Test database connection
+    const result = await queryWithRetry('SELECT NOW()', [], 2);
+    res.json({ 
+      status: 'OK', 
+      message: 'UROWN API is running and database connection is working',
+      timestamp: result.rows[0].now,
+      uptime: process.uptime()
+    });
   } catch (error) {
-    console.error('Database connection error:', error);
-    res.status(500).json({ status: 'ERROR', message: 'Database connection failed' });
+    console.error('Health check database error:', error);
+    res.status(503).json({ 
+      status: 'DEGRADED', 
+      message: 'API is running but database connection failed',
+      error: error.message
+    });
   }
 });
+
+// Keep-alive endpoint (lighter weight)
+app.get('/api/ping', (req, res) => {
+  res.json({ status: 'pong', timestamp: Date.now() });
+});
+
+// Optional: Add a self-ping to prevent cold starts
+// Only enable this if you're on Render free tier
+if (process.env.RENDER && process.env.NODE_ENV === 'production') {
+  const SELF_PING_INTERVAL = 14 * 60 * 1000; // 14 minutes (Render free tier sleeps after 15 minutes)
+  
+  setInterval(() => {
+    axios.get(`${process.env.RENDER_EXTERNAL_URL || 'https://urown-backend.onrender.com'}/api/ping`)
+      .then(() => console.log('Self-ping successful'))
+      .catch(err => console.error('Self-ping failed:', err.message));
+  }, SELF_PING_INTERVAL);
+}
 
 // Get all available topics
 app.get('/api/topics', async (req, res) => {
@@ -2266,7 +2349,8 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
 // Get user profile
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
+    // Use queryWithRetry for better reliability
+    const result = await queryWithRetry(
       `SELECT id, email, phone, full_name, display_name, discord_username, tier, role, 
               weekly_articles_count, weekly_reset_date, 
               display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
@@ -2290,18 +2374,39 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
     const daysSinceReset = Math.floor((now - resetDate) / (24 * 60 * 60 * 1000));
 
     if (daysSinceReset >= 7) {
-      await pool.query(
-        'UPDATE users SET weekly_articles_count = 0, weekly_reset_date = $1 WHERE id = $2',
-        [now, user.id]
-      );
-      user.weekly_articles_count = 0;
+      try {
+        await queryWithRetry(
+          'UPDATE users SET weekly_articles_count = 0, weekly_reset_date = $1 WHERE id = $2',
+          [now, user.id]
+        );
+        user.weekly_articles_count = 0;
+      } catch (updateError) {
+        console.error('Error resetting weekly count:', updateError);
+        // Continue anyway - this is not critical
+      }
     }
 
     res.json({ user });
 
   } catch (error) {
     console.error('Profile fetch error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Error details:', {
+      code: error.code,
+      message: error.message,
+      stack: error.stack
+    });
+    
+    // Return a more specific error
+    if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
+      res.status(503).json({ 
+        error: 'Database temporarily unavailable. Please try again in a moment.' 
+      });
+    } else {
+      res.status(500).json({ 
+        error: 'Internal server error',
+        details: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    }
   }
 });
 
@@ -2663,7 +2768,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
         [parent_article_id]
       );
 
-      if (parseInt(counterCountResult.rows[0].count) >= 5) {
+            if (parseInt(counterCountResult.rows[0].count) >= 5) {
         return res.status(400).json({ error: 'Maximum number of counter opinions reached for this article' });
       }
     }
@@ -5231,7 +5336,7 @@ app.get('/api/redflagged/:id/related', async (req, res) => {
       LIMIT $3
     `, [companyName, id, parseInt(limit)]);
     
-    res.json({ posts: result.rows });
+        res.json({ posts: result.rows });
   } catch (error) {
     console.error('Get related posts error:', error);
     res.status(500).json({ error: 'Internal server error' });
