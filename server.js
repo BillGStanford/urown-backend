@@ -11,119 +11,33 @@ const session = require('express-session');
 const PgSession = require('connect-pg-simple')(session);
 const path = require('path');
 const fs = require('fs');
-const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// START: Replace from line 20 to line 82 in server.js
-
-// Database connection with retry logic
+// Database connection
 let pool;
-const createPool = () => {
-  const config = {
+if (process.env.DATABASE_URL) {
+  pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-    max: 20,
-    min: 2,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000,
-    allowExitOnIdle: false,
-    statement_timeout: 30000,
-    query_timeout: 30000
-  };
-
-  // If no DATABASE_URL, use individual params
-  if (!process.env.DATABASE_URL) {
-    delete config.connectionString;
-    config.host = process.env.DB_HOST;
-    config.port = process.env.DB_PORT;
-    config.database = process.env.DB_NAME;
-    config.user = process.env.DB_USER;
-    config.password = process.env.DB_PASSWORD;
-  }
-
-  return new Pool(config);
-};
-
-pool = createPool();
-
-// Handle pool errors
-pool.on('error', (err) => {
-  console.error('❌ Database pool error:', err);
-  console.error('❌ Attempting to recreate pool...');
-  setTimeout(() => {
-    pool = createPool();
-  }, 5000);
-});
-
-// Test connection and log result
-const testConnection = async () => {
-  for (let i = 0; i < 5; i++) {
-    try {
-      const client = await pool.connect();
-      try {
-        const result = await client.query('SELECT NOW() as now');
-        console.log('✅ Database connected at:', result.rows[0].now);
-        return true;
-      } finally {
-        client.release();
-      }
-    } catch (err) {
-      console.error(`❌ Connection attempt ${i + 1}/5 failed:`, err.message);
-      if (i < 4) {
-        await new Promise(r => setTimeout(r, 3000));
-      }
+    ssl: { 
+      rejectUnauthorized: false,
+      sslmode: 'require'
     }
-  }
-  console.error('💥 Failed to connect after 5 attempts');
-  return false;
-};
-
-testConnection();
-
-
-// Query wrapper with retry
-const queryWithRetry = async (queryText, params, maxRetries = 3) => {
-  let lastError;
-  
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    let client;
-    try {
-      client = await pool.connect();
-      const result = await client.query(queryText, params);
-      return result;
-    } catch (error) {
-      lastError = error;
-      console.error(`Query attempt ${attempt + 1}/${maxRetries} failed:`, error.message);
-      
-      // Check if it's a connection error that warrants a retry
-      if (error.code === 'ECONNREFUSED' || 
-          error.code === 'ETIMEDOUT' || 
-          error.code === 'ENOTFOUND' ||
-          error.message?.includes('Connection terminated') ||
-          error.message?.includes('connection timeout')) {
-        
-        if (attempt < maxRetries - 1) {
-          const delay = Math.min(2000 * Math.pow(2, attempt), 10000);
-          console.log(`⏳ Waiting ${delay}ms before retry...`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-        }
-      } else {
-        // For non-connection errors, don't retry
-        throw error;
-      }
-    } finally {
-      if (client) {
-        client.release();
-      }
+  });
+} else {
+  pool = new Pool({
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    database: process.env.DB_NAME,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    ssl: { 
+      rejectUnauthorized: false,
+      sslmode: 'require'
     }
-  }
-  
-  throw lastError;
-};
-
-// END: This replaces up to line 82
+  });
+}
 
 // Middleware
 // More permissive CORS for production
@@ -312,7 +226,6 @@ const initDatabase = async () => {
         hard_deleted_at TIMESTAMP,
         deletion_reason TEXT,
         followers INTEGER DEFAULT 0,
-        invite_code VARCHAR(5),
         CONSTRAINT min_age CHECK (date_of_birth <= CURRENT_DATE - INTERVAL '15 years')
       )
     `);
@@ -661,29 +574,6 @@ const initDatabase = async () => {
     `);
 
     console.log('Bookmarks table initialized successfully');
-
-    // ============================================
-    // INVITE CODES TABLE
-    // ============================================
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS invite_codes (
-        id SERIAL PRIMARY KEY,
-        code VARCHAR(5) UNIQUE NOT NULL,
-        name VARCHAR(255) NOT NULL,
-        description TEXT,
-        active BOOLEAN DEFAULT TRUE,
-        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_invite_codes_code ON invite_codes(code);
-      CREATE INDEX IF NOT EXISTS idx_invite_codes_active ON invite_codes(active);
-    `);
-
-    console.log('Invite codes table initialized successfully');
 
     // ============================================
     // REDFLAGGED TABLES
@@ -1085,43 +975,15 @@ const validateLogin = [
 ];
 
 // Routes
-// Health check endpoint that's more robust
 app.get('/api/health', async (req, res) => {
   try {
-    // Test database connection
-    const result = await queryWithRetry('SELECT NOW()', [], 2);
-    res.json({ 
-      status: 'OK', 
-      message: 'UROWN API is running and database connection is working',
-      timestamp: result.rows[0].now,
-      uptime: process.uptime()
-    });
+    await pool.query('SELECT NOW()');
+    res.json({ status: 'OK', message: 'UROWN API is running and database connection is working' });
   } catch (error) {
-    console.error('Health check database error:', error);
-    res.status(503).json({ 
-      status: 'DEGRADED', 
-      message: 'API is running but database connection failed',
-      error: error.message
-    });
+    console.error('Database connection error:', error);
+    res.status(500).json({ status: 'ERROR', message: 'Database connection failed' });
   }
 });
-
-// Keep-alive endpoint (lighter weight)
-app.get('/api/ping', (req, res) => {
-  res.json({ status: 'pong', timestamp: Date.now() });
-});
-
-// Optional: Add a self-ping to prevent cold starts
-// Only enable this if you're on Render free tier
-if (process.env.RENDER && process.env.NODE_ENV === 'production') {
-  const SELF_PING_INTERVAL = 14 * 60 * 1000; // 14 minutes (Render free tier sleeps after 15 minutes)
-  
-  setInterval(() => {
-    axios.get(`${process.env.RENDER_EXTERNAL_URL || 'https://urown-backend.onrender.com'}/api/ping`)
-      .then(() => console.log('Self-ping successful'))
-      .catch(err => console.error('Self-ping failed:', err.message));
-  }, SELF_PING_INTERVAL);
-}
 
 // Get all available topics
 app.get('/api/topics', async (req, res) => {
@@ -1818,342 +1680,42 @@ app.delete('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
   }
 });
 
-// ============================================
-// INVITE CODE ROUTES
-// ============================================
-
-// Validate invite code (public route)
-app.get('/api/invite-codes/validate/:code', async (req, res) => {
-  try {
-    const { code } = req.params;
-    
-    // Check if code exists and is active
-    const result = await pool.query(
-      'SELECT code, name, description FROM invite_codes WHERE code = $1 AND active = TRUE',
-      [code.toUpperCase()]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ valid: false, error: 'Invalid or inactive invite code' });
-    }
-    
-    res.json({ 
-      valid: true, 
-      code: result.rows[0].code,
-      name: result.rows[0].name,
-      description: result.rows[0].description
-    });
-  } catch (error) {
-    console.error('Validate invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get all invite codes (admin only)
-app.get('/api/admin/invite-codes', authenticateAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT 
-        ic.*,
-        u.display_name as created_by_name,
-        COUNT(DISTINCT us.id) as total_users
-      FROM invite_codes ic
-      LEFT JOIN users u ON ic.created_by = u.id
-      LEFT JOIN users us ON us.invite_code = ic.code
-      GROUP BY ic.id, u.display_name
-      ORDER BY ic.created_at DESC
-    `);
-    
-    res.json({ codes: result.rows });
-  } catch (error) {
-    console.error('Get invite codes error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get invite code leaderboard (admin only)
-app.get('/api/admin/invite-codes/leaderboard', authenticateAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT 
-        ic.code,
-        ic.name,
-        ic.description,
-        ic.active,
-        COUNT(DISTINCT u.id) as user_count,
-        ic.created_at
-      FROM invite_codes ic
-      LEFT JOIN users u ON u.invite_code = ic.code
-      GROUP BY ic.id, ic.code, ic.name, ic.description, ic.active, ic.created_at
-      HAVING COUNT(DISTINCT u.id) > 0
-      ORDER BY user_count DESC, ic.created_at DESC
-    `);
-    
-    res.json({ leaderboard: result.rows });
-  } catch (error) {
-    console.error('Get invite code leaderboard error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get users by invite code (admin only)
-app.get('/api/admin/invite-codes/:code/users', authenticateAdmin, async (req, res) => {
-  try {
-    const { code } = req.params;
-    
-    const result = await pool.query(`
-      SELECT 
-        u.id,
-        u.display_name,
-        u.email,
-        u.tier,
-        u.role,
-        u.created_at,
-        u.urown_score
-      FROM users u
-      WHERE u.invite_code = $1
-      ORDER BY u.created_at DESC
-    `, [code.toUpperCase()]);
-    
-    res.json({ users: result.rows });
-  } catch (error) {
-    console.error('Get users by invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Create invite code (admin only)
-app.post('/api/admin/invite-codes', authenticateAdmin, async (req, res) => {
-  try {
-    const { code, name, description } = req.body;
-    const adminId = req.user.userId;
-    
-    // Validate input
-    if (!code || !name) {
-      return res.status(400).json({ error: 'Code and name are required' });
-    }
-    
-    // Validate code format (5 characters, alphanumeric)
-    if (!/^[A-Z0-9]{5}$/.test(code.toUpperCase())) {
-      return res.status(400).json({ error: 'Code must be exactly 5 alphanumeric characters' });
-    }
-    
-    // Check if code already exists
-    const existingCode = await pool.query(
-      'SELECT id FROM invite_codes WHERE code = $1',
-      [code.toUpperCase()]
-    );
-    
-    if (existingCode.rows.length > 0) {
-      return res.status(400).json({ error: 'This invite code already exists' });
-    }
-    
-    // Create invite code
-    const result = await pool.query(
-      `INSERT INTO invite_codes (code, name, description, created_by)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [code.toUpperCase(), name.trim(), description?.trim() || null, adminId]
-    );
-    
-    // Log action
-    await logAdminAction(
-      adminId,
-      'create',
-      'invite_code',
-      result.rows[0].id,
-      `Created invite code: ${code.toUpperCase()} (${name})`
-    );
-    
-    res.status(201).json({
-      message: 'Invite code created successfully',
-      code: result.rows[0]
-    });
-  } catch (error) {
-    console.error('Create invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update invite code (admin only)
-app.put('/api/admin/invite-codes/:id', authenticateAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, description, active } = req.body;
-    
-    // Check if code exists
-    const codeCheck = await pool.query(
-      'SELECT * FROM invite_codes WHERE id = $1',
-      [id]
-    );
-    
-    if (codeCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Invite code not found' });
-    }
-    
-    // Update invite code
-    const result = await pool.query(
-      `UPDATE invite_codes 
-       SET name = COALESCE($1, name),
-           description = COALESCE($2, description),
-           active = COALESCE($3, active),
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $4
-       RETURNING *`,
-      [name?.trim(), description?.trim(), active, id]
-    );
-    
-    // Log action
-    await logAdminAction(
-      req.user.userId,
-      'update',
-      'invite_code',
-      parseInt(id),
-      `Updated invite code: ${result.rows[0].code}`
-    );
-    
-    res.json({
-      message: 'Invite code updated successfully',
-      code: result.rows[0]
-    });
-  } catch (error) {
-    console.error('Update invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Toggle invite code active status (admin only)
-app.patch('/api/admin/invite-codes/:id/toggle', authenticateAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    const result = await pool.query(
-      `UPDATE invite_codes 
-       SET active = NOT active,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1
-       RETURNING *`,
-      [id]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Invite code not found' });
-    }
-    
-    // Log action
-    await logAdminAction(
-      req.user.userId,
-      result.rows[0].active ? 'activate' : 'deactivate',
-      'invite_code',
-      parseInt(id),
-      `${result.rows[0].active ? 'Activated' : 'Deactivated'} invite code: ${result.rows[0].code}`
-    );
-    
-    res.json({
-      message: `Invite code ${result.rows[0].active ? 'activated' : 'deactivated'} successfully`,
-      code: result.rows[0]
-    });
-  } catch (error) {
-    console.error('Toggle invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Delete invite code (admin only)
-app.delete('/api/admin/invite-codes/:id', authenticateAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    // Get code info before deletion
-    const codeResult = await pool.query(
-      'SELECT * FROM invite_codes WHERE id = $1',
-      [id]
-    );
-    
-    if (codeResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Invite code not found' });
-    }
-    
-    const code = codeResult.rows[0];
-    
-    // Check if any users are using this code
-    const userCount = await pool.query(
-      'SELECT COUNT(*) as count FROM users WHERE invite_code = $1',
-      [code.code]
-    );
-    
-    const count = parseInt(userCount.rows[0].count);
-    
-    // Delete invite code
-    await pool.query('DELETE FROM invite_codes WHERE id = $1', [id]);
-    
-    // Log action
-    await logAdminAction(
-      req.user.userId,
-      'delete',
-      'invite_code',
-      parseInt(id),
-      `Deleted invite code: ${code.code} (${code.name}) - ${count} users affected`
-    );
-    
-    res.json({ 
-      message: 'Invite code deleted successfully',
-      users_affected: count
-    });
-  } catch (error) {
-    console.error('Delete invite code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// REPLACE lines 1977-2167 in server.js
-// Search for: app.post('/api/auth/signup'
-
+// Signup
 app.post('/api/auth/signup', async (req, res) => {
-  const client = await pool.connect();
   try {
-    const { email, phone, full_name, display_name, discord_username, date_of_birth, password, invite_code, terms_agreed } = req.body;
+    const { email, phone, full_name, display_name, discord_username, date_of_birth, password, terms_agreed } = req.body;
     
-    // Manual validation
+    // Manual validation for better error messages
     const errors = {};
     
+    // Email validation
     if (!email) {
       errors.email = 'Email is required';
     } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       errors.email = 'Please enter a valid email address';
     }
     
+    // Phone validation (optional)
     if (phone && !/^\+?[1-9]\d{1,14}$/.test(phone.replace(/\s/g, ''))) {
       errors.phone = 'Please enter a valid phone number';
     }
     
+    // Full name validation (now optional)
     if (full_name && full_name.trim().length > 0 && full_name.trim().length < 2) {
       errors.full_name = 'Full name must be at least 2 characters';
     }
     
+    // Display name validation
     if (!display_name || display_name.trim().length < 2) {
       errors.display_name = 'Display name must be at least 2 characters';
     }
     
+    // Discord username validation (optional)
     if (discord_username && discord_username.trim().length > 0 && discord_username.trim().length < 2) {
       errors.discord_username = 'Discord username must be at least 2 characters';
     }
     
-    if (invite_code && invite_code.trim().length > 0) {
-      if (invite_code.trim().length !== 5) {
-        errors.invite_code = 'Invite code must be exactly 5 characters';
-      } else {
-        const inviteCheck = await client.query(
-          'SELECT id FROM invite_codes WHERE code = $1 AND active = TRUE',
-          [invite_code.toUpperCase()]
-        );
-        
-        if (inviteCheck.rows.length === 0) {
-          errors.invite_code = 'Invalid or inactive invite code';
-        }
-      }
-    }
-    
+    // Date of birth validation
     if (!date_of_birth) {
       errors.date_of_birth = 'Date of birth is required';
     } else {
@@ -2165,16 +1727,19 @@ app.post('/api/auth/signup', async (req, res) => {
       }
     }
     
+    // Password validation
     if (!password || password.length < 8) {
       errors.password = 'Password must be at least 8 characters';
     } else if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(password)) {
       errors.password = 'Password must contain uppercase, lowercase, and number';
     }
     
+    // Terms validation
     if (terms_agreed !== true) {
       errors.terms_agreed = 'You must agree to the terms of service';
     }
     
+    // If there are validation errors, return them
     if (Object.keys(errors).length > 0) {
       return res.status(400).json({ 
         error: 'Validation failed', 
@@ -2182,8 +1747,8 @@ app.post('/api/auth/signup', async (req, res) => {
       });
     }
     
-    // Check existing user
-    const existingUser = await client.query(
+    // Check if email or display name already exists
+    const existingUser = await pool.query(
       'SELECT id FROM users WHERE email = $1 OR display_name = $2',
       [email, display_name]
     );
@@ -2192,9 +1757,9 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ error: 'Email or display name already exists' });
     }
 
-    // Check Discord username
+    // Check if Discord username is already in use (if provided)
     if (discord_username && discord_username.trim()) {
-      const existingDiscord = await client.query(
+      const existingDiscord = await pool.query(
         'SELECT id FROM users WHERE discord_username = $1',
         [discord_username.trim()]
       );
@@ -2209,21 +1774,11 @@ app.post('/api/auth/signup', async (req, res) => {
     const password_hash = await bcrypt.hash(password, saltRounds);
 
     // Create user
-    const result = await client.query(
-      `INSERT INTO users (email, phone, full_name, display_name, discord_username, date_of_birth, password_hash, invite_code, terms_agreed)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, invite_code, created_at`,
-      [
-        email, 
-        phone || null, 
-        full_name || null, 
-        display_name, 
-        discord_username || null, 
-        date_of_birth, 
-        password_hash, 
-        invite_code ? invite_code.toUpperCase() : null,
-        terms_agreed
-      ]
+    const result = await pool.query(
+      `INSERT INTO users (email, phone, full_name, display_name, discord_username, date_of_birth, password_hash, terms_agreed)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, email, phone, full_name, display_name, discord_username, tier, role, created_at`,
+      [email, phone || null, full_name || null, display_name, discord_username || null, date_of_birth, password_hash, terms_agreed]
     );
 
     const user = result.rows[0];
@@ -2247,22 +1802,16 @@ app.post('/api/auth/signup', async (req, res) => {
         discord_username: user.discord_username,
         tier: user.tier,
         role: user.role,
-        invite_code: user.invite_code,
         created_at: user.created_at
       }
     });
 
   } catch (error) {
-    console.error('❌ Signup error:', error.message);
-    console.error('Error code:', error.code);
-    console.error('Error detail:', error.detail);
-    
+    console.error('Signup error:', error);
     res.status(500).json({ 
       error: 'Internal server error', 
-      details: process.env.NODE_ENV === 'development' ? error.message : 'Registration failed. Please try again.'
+      details: error.message || 'An unknown error occurred during registration' 
     });
-  } finally {
-    client.release();
   }
 });
 
@@ -2374,35 +1923,25 @@ app.post('/api/auth/login', validateLogin, async (req, res) => {
   }
 });
 
-// REPLACE lines 2752-2810 in server.js
-// Search for: app.get('/api/user/profile'
-
+// Get user profile
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
-  let client;
   try {
-    console.log('🔍 Fetching user profile for user ID:', req.user.userId);
-    
-    // Use queryWithRetry for better reliability
-    const result = await queryWithRetry(
+    const result = await pool.query(
       `SELECT id, email, phone, full_name, display_name, discord_username, tier, role, 
               weekly_articles_count, weekly_reset_date, 
               display_name_updated_at, email_updated_at, phone_updated_at, password_updated_at, 
               discord_username_updated_at, created_at, followers, urown_score,
-              ideology, ideology_details, ideology_public, ideology_updated_at,
-              invite_code
+              ideology, ideology_details, ideology_public, ideology_updated_at
        FROM users 
        WHERE id = $1`,
-      [req.user.userId],
-      2 // retry once if needed
+      [req.user.userId]
     );
 
     if (result.rows.length === 0) {
-      console.log('❌ User not found in database');
       return res.status(404).json({ error: 'User not found' });
     }
 
     const user = result.rows[0];
-    console.log('✅ User profile found:', user.display_name);
 
     // Check if we need to reset weekly article count
     const now = new Date();
@@ -2410,47 +1949,18 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
     const daysSinceReset = Math.floor((now - resetDate) / (24 * 60 * 60 * 1000));
 
     if (daysSinceReset >= 7) {
-      try {
-        console.log('🔄 Resetting weekly article count for user:', user.display_name);
-        await queryWithRetry(
-          'UPDATE users SET weekly_articles_count = 0, weekly_reset_date = $1 WHERE id = $2',
-          [now, user.id],
-          2
-        );
-        user.weekly_articles_count = 0;
-        console.log('✅ Weekly count reset successfully');
-      } catch (updateError) {
-        console.error('❌ Error resetting weekly count:', updateError);
-        // Continue anyway - this is not critical
-      }
+      await pool.query(
+        'UPDATE users SET weekly_articles_count = 0, weekly_reset_date = $1 WHERE id = $2',
+        [now, user.id]
+      );
+      user.weekly_articles_count = 0;
     }
 
     res.json({ user });
 
   } catch (error) {
-    console.error('❌ Profile fetch error:', error.message);
-    console.error('Error details:', {
-      code: error.code,
-      message: error.message,
-      stack: error.stack
-    });
-    
-    // Return a more specific error
-    if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
-      res.status(503).json({ 
-        error: 'Database temporarily unavailable. Please try again in a moment.' 
-      });
-    } else if (error.code === '23505') {
-      // Unique constraint violation
-      res.status(409).json({ 
-        error: 'Data conflict. Please try again.' 
-      });
-    } else {
-      res.status(500).json({ 
-        error: 'Internal server error',
-        details: process.env.NODE_ENV === 'development' ? error.message : undefined
-      });
-    }
+    console.error('Profile fetch error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -2812,7 +2322,7 @@ app.post('/api/articles', authenticateToken, async (req, res) => {
         [parent_article_id]
       );
 
-            if (parseInt(counterCountResult.rows[0].count) >= 5) {
+      if (parseInt(counterCountResult.rows[0].count) >= 5) {
         return res.status(400).json({ error: 'Maximum number of counter opinions reached for this article' });
       }
     }
@@ -3341,8 +2851,7 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
     const result = await pool.query(
       `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.discord_username, u.tier, u.role, 
               u.weekly_articles_count, u.created_at, u.updated_at, u.urown_score,
-              ub.ban_end, ub.reason as ban_reason,
-              u.invite_code
+              ub.ban_end, ub.reason as ban_reason
        FROM users u
        LEFT JOIN user_bans ub ON u.id = ub.user_id AND ub.ban_end > CURRENT_TIMESTAMP
        WHERE u.account_status = 'active'
@@ -3364,8 +2873,7 @@ app.get('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
     const result = await pool.query(
       `SELECT u.id, u.email, u.phone, u.full_name, u.display_name, u.discord_username, u.tier, u.role, 
               u.weekly_articles_count, u.created_at, u.updated_at, u.urown_score,
-              ub.ban_end, ub.reason as ban_reason,
-              u.invite_code
+              ub.ban_end, ub.reason as ban_reason
        FROM users u
        LEFT JOIN user_bans ub ON u.id = ub.user_id AND ub.ban_end > CURRENT_TIMESTAMP
        WHERE u.id = $1`,
@@ -4117,6 +3625,7 @@ app.get('/api/users/:display_name', async (req, res) => {
 });
 
 // Follow a user
+// Follow a user
 app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
   const client = await pool.connect();
   
@@ -4181,6 +3690,7 @@ app.post('/api/users/:id/follow', authenticateToken, async (req, res) => {
   }
 });
 
+// Unfollow a user
 // Unfollow a user
 app.delete('/api/users/:id/follow', authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -5380,7 +4890,7 @@ app.get('/api/redflagged/:id/related', async (req, res) => {
       LIMIT $3
     `, [companyName, id, parseInt(limit)]);
     
-        res.json({ posts: result.rows });
+    res.json({ posts: result.rows });
   } catch (error) {
     console.error('Get related posts error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -5881,43 +5391,7 @@ setInterval(async () => {
 }, 60 * 60 * 1000); // Every hour
 
 // Add this catch-all route at very end, before error handling middleware
-
-// Enhanced health check endpoint
-app.get('/api/health/deep', async (req, res) => {
-  try {
-    // Test database connection with a simple query
-    const dbResult = await queryWithRetry('SELECT NOW() as current_time, version() as db_version', [], 1);
-    
-    // Check if users table is accessible
-    const usersCount = await queryWithRetry('SELECT COUNT(*) as user_count FROM users WHERE account_status = $1', ['active'], 1);
-    
-    res.json({ 
-      status: 'HEALTHY',
-      timestamp: new Date().toISOString(),
-      database: {
-        connected: true,
-        current_time: dbResult.rows[0].current_time,
-        db_version: dbResult.rows[0].db_version,
-        active_users: parseInt(usersCount.rows[0].user_count)
-      },
-      uptime: process.uptime(),
-      memory: process.memoryUsage()
-    });
-  } catch (error) {
-    console.error('❌ Deep health check failed:', error);
-    res.status(503).json({ 
-      status: 'UNHEALTHY',
-      timestamp: new Date().toISOString(),
-      database: {
-        connected: false,
-        error: error.message
-      },
-      uptime: process.uptime()
-    });
-  }
-});
-
-// This serves React app for any route that doesn't match API routes
+// This serves the React app for any route that doesn't match API routes
 app.get('*', (req, res) => {
   if (fs.existsSync(buildPath)) {
     res.sendFile(path.join(buildPath, 'index.html'));
