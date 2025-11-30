@@ -15,6 +15,7 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+
 // Database connection
 let pool;
 if (process.env.DATABASE_URL) {
@@ -3081,6 +3082,7 @@ app.get('/api/admin/audit-log', authenticateSuperAdmin, async (req, res) => {
 });
 
 // Get admin dashboard stats (admin only)
+// Update the admin stats endpoint in server.js to include ebook stats
 app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
   try {
     // Get user counts by role
@@ -3102,6 +3104,15 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
        LEFT JOIN editorial_certifications ec ON a.id = ec.article_id`
     );
     
+    // Get ebook counts
+    const ebookCountsResult = await pool.query(
+      `SELECT 
+         COUNT(*) as total_ebooks,
+         COUNT(CASE WHEN published = true THEN 1 END) as published_ebooks,
+         COUNT(CASE WHEN published = false THEN 1 END) as draft_ebooks
+       FROM ebooks`
+    );
+    
     // Get total views
     const viewsResult = await pool.query(
       'SELECT COALESCE(SUM(views), 0) as total_views FROM articles'
@@ -3119,6 +3130,7 @@ app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
     res.json({
       userCounts: userCountsResult.rows,
       articleStats: articleCountsResult.rows[0],
+      ebookStats: ebookCountsResult.rows[0], // Add this line
       totalViews: parseInt(viewsResult.rows[0].total_views),
       recentActivity: recentActivityResult.rows
     });
@@ -5212,6 +5224,176 @@ app.delete('/api/admin/redflagged/topics/:id', authenticateEditorialBoard, async
   }
 });
 
+// Get all ebooks (admin only)
+app.get('/api/admin/ebooks', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        e.id, e.title, e.subtitle, e.description, e.author_name, 
+        e.cover_image, e.page_count, e.views, e.published, e.published_at,
+        e.created_at, e.updated_at, e.slug,
+        u.display_name as creator_name,
+        COALESCE(
+          ARRAY_AGG(et.name ORDER BY et.name) FILTER (WHERE et.name IS NOT NULL),
+          ARRAY[]::VARCHAR[]
+        ) as tags,
+        (SELECT COUNT(*) FROM ebook_chapters WHERE ebook_id = e.id) as chapter_count
+      FROM ebooks e
+      LEFT JOIN users u ON e.user_id = u.id
+      LEFT JOIN ebook_tag_relations etr ON e.id = etr.ebook_id
+      LEFT JOIN ebook_tags et ON etr.tag_id = et.id
+      GROUP BY e.id, u.display_name
+      ORDER BY e.created_at DESC
+    `);
+
+    res.json({ ebooks: result.rows });
+  } catch (error) {
+    console.error('Get admin ebooks error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete ebook (admin only)
+app.delete('/api/admin/ebooks/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get ebook data before deletion for logging
+    const ebookResult = await pool.query(
+      `SELECT e.*, u.display_name as author_name 
+       FROM ebooks e
+       LEFT JOIN users u ON e.user_id = u.id
+       WHERE e.id = $1`,
+      [id]
+    );
+    
+    if (ebookResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Ebook not found' });
+    }
+    
+    const ebook = ebookResult.rows[0];
+    
+    // Start a transaction to ensure all related data is deleted properly
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      
+      // Delete related data first (due to foreign key constraints)
+      await client.query('DELETE FROM ebook_highlights WHERE ebook_id = $1', [id]);
+      await client.query('DELETE FROM reading_progress WHERE ebook_id = $1', [id]);
+      await client.query('DELETE FROM ebook_views WHERE ebook_id = $1', [id]);
+      await client.query('DELETE FROM ebook_tag_relations WHERE ebook_id = $1', [id]);
+      await client.query('DELETE FROM ebook_chapters WHERE ebook_id = $1', [id]);
+      
+      // Finally delete the ebook
+      await client.query('DELETE FROM ebooks WHERE id = $1', [id]);
+      
+      await client.query('COMMIT');
+      
+      // Log the action
+      await logAdminAction(
+        req.user.userId,
+        'delete',
+        'ebook',
+        parseInt(id),
+        `Deleted ebook: ${ebook.title} by ${ebook.author_name || ebook.creator_name}`
+      );
+      
+      res.json({ message: 'Ebook deleted successfully' });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Delete admin ebook error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update ebook published status (admin only)
+app.put('/api/admin/ebooks/:id/publish', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { published } = req.body;
+    
+    // Check if ebook exists
+    const ebookResult = await pool.query(
+      'SELECT * FROM ebooks WHERE id = $1',
+      [id]
+    );
+    
+    if (ebookResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Ebook not found' });
+    }
+    
+    const ebook = ebookResult.rows[0];
+    
+    // If publishing, check if ebook meets minimum page requirement
+    if (published) {
+      const chapterCountResult = await pool.query(
+        'SELECT COUNT(*) as count FROM ebook_chapters WHERE ebook_id = $1',
+        [id]
+      );
+      
+      const chapterCount = parseInt(chapterCountResult.rows[0].count);
+      
+      if (chapterCount < 3) { // Assuming minimum 3 chapters/pages
+        return res.status(400).json({ 
+          error: 'Ebook must have at least 3 chapters to be published',
+          details: `Current chapters: ${chapterCount}, Required: 3`
+        });
+      }
+      
+      // Also check page count if available
+      if (ebook.page_count && ebook.page_count < 30) {
+        return res.status(400).json({ 
+          error: 'Ebook must have at least 30 pages to be published',
+          details: `Current pages: ${ebook.page_count}, Required: 30`
+        });
+      }
+    }
+    
+    // Update published status
+    await pool.query(
+      `UPDATE ebooks 
+       SET published = $1, 
+           published_at = CASE WHEN $1 = true AND published = false THEN CURRENT_TIMESTAMP ELSE published_at END,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2`,
+      [published, id]
+    );
+    
+    // Log the action
+    await logAdminAction(
+      req.user.userId,
+      published ? 'publish' : 'unpublish',
+      'ebook',
+      parseInt(id),
+      `${published ? 'Published' : 'Unpublished'} ebook: ${ebook.title}`
+    );
+    
+    res.json({ message: `Ebook ${published ? 'published' : 'unpublished'} successfully` });
+  } catch (error) {
+    console.error('Update ebook publish status error:', error);
+    
+    // Handle specific constraint violation
+    if (error.code === '23514' && error.constraint === 'min_pages_published') {
+      return res.status(400).json({ 
+        error: 'Ebook does not meet minimum requirements for publishing',
+        details: 'Ebook must have at least 30 pages to be published'
+      });
+    }
+    
+    res.status(500).json({ 
+      error: 'Internal server error', 
+      details: error.message 
+    });
+  }
+});
+
+
 // ============================================
 // LEADERBOARD ROUTES
 // ============================================
@@ -5389,6 +5571,739 @@ setInterval(async () => {
     console.error('Auto milestone check error:', error);
   }
 }, 60 * 60 * 1000); // Every hour
+
+// ============================================
+// EBOOK ROUTES
+// ============================================
+
+// Get all ebook tags
+app.get('/api/ebooks/tags', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM ebook_tags ORDER BY name');
+    res.json({ tags: result.rows });
+  } catch (error) {
+    console.error('Get ebook tags error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Browse published ebooks with filters
+app.get('/api/ebooks', async (req, res) => {
+  try {
+    const { 
+      limit = 20, 
+      offset = 0, 
+      sort = 'recent',
+      type = 'all', // all, short, long
+      search = '',
+      tagId 
+    } = req.query;
+    
+    let query = `
+      SELECT 
+        e.*,
+        u.display_name as author_display_name,
+        COALESCE(
+          ARRAY_AGG(et.name ORDER BY et.name) FILTER (WHERE et.name IS NOT NULL),
+          ARRAY[]::VARCHAR[]
+        ) as tags
+      FROM ebooks e
+      LEFT JOIN users u ON e.user_id = u.id
+      LEFT JOIN ebook_tag_relations etr ON e.id = etr.ebook_id
+      LEFT JOIN ebook_tags et ON etr.tag_id = et.id
+      WHERE e.published = true
+    `;
+    
+    const params = [];
+    let paramIndex = 1;
+    
+    // Filter by book type (short vs long)
+    if (type === 'short') {
+      query += ` AND e.page_count < 30`;
+    } else if (type === 'long') {
+      query += ` AND e.page_count >= 30`;
+    }
+    
+    // Search filter
+    if (search) {
+      query += ` AND (LOWER(e.title) LIKE LOWER($${paramIndex}) OR LOWER(e.author_name) LIKE LOWER($${paramIndex}))`;
+      params.push(`%${search}%`);
+      paramIndex++;
+    }
+    
+    // Tag filter
+    if (tagId) {
+      query += ` AND EXISTS (
+        SELECT 1 FROM ebook_tag_relations 
+        WHERE ebook_id = e.id AND tag_id = $${paramIndex}
+      )`;
+      params.push(tagId);
+      paramIndex++;
+    }
+    
+    query += ' GROUP BY e.id, u.display_name';
+    
+    // Sorting with priority system
+    switch (sort) {
+      case 'popular':
+        query += ` ORDER BY 
+          CASE WHEN e.page_count >= 30 THEN 1 ELSE 2 END,
+          e.views DESC, 
+          e.created_at DESC`;
+        break;
+      case 'title':
+        query += ` ORDER BY 
+          CASE WHEN e.page_count >= 30 THEN 1 ELSE 2 END,
+          e.title ASC`;
+        break;
+      default: // recent
+        query += ` ORDER BY 
+          CASE WHEN e.page_count >= 30 THEN 1 ELSE 2 END,
+          e.published_at DESC NULLS LAST,
+          e.created_at DESC`;
+    }
+    
+    query += ` LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    
+    // Get total count for pagination
+    let countQuery = 'SELECT COUNT(*) as total FROM ebooks e WHERE e.published = true';
+    const countParams = [];
+    let countIndex = 1;
+    
+    if (type === 'short') {
+      countQuery += ' AND e.page_count < 30';
+    } else if (type === 'long') {
+      countQuery += ' AND e.page_count >= 30';
+    }
+    
+    if (search) {
+      countQuery += ` AND (LOWER(e.title) LIKE LOWER($${countIndex}) OR LOWER(e.author_name) LIKE LOWER($${countIndex}))`;
+      countParams.push(`%${search}%`);
+      countIndex++;
+    }
+    
+    if (tagId) {
+      countQuery += ` AND EXISTS (
+        SELECT 1 FROM ebook_tag_relations 
+        WHERE ebook_id = e.id AND tag_id = $${countIndex}
+      )`;
+      countParams.push(tagId);
+    }
+    
+    const countResult = await pool.query(countQuery, countParams);
+    
+    res.json({ 
+      ebooks: result.rows,
+      total: parseInt(countResult.rows[0].total)
+    });
+  } catch (error) {
+    console.error('Browse ebooks error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get single ebook by slug
+app.get('/api/ebooks/slug/:slug', async (req, res) => {
+  try {
+    const { slug } = req.params;
+    
+    const ebookResult = await pool.query(`
+      SELECT 
+        e.*,
+        u.display_name as author_display_name,
+        COALESCE(
+          ARRAY_AGG(et.name ORDER BY et.name) FILTER (WHERE et.name IS NOT NULL),
+          ARRAY[]::VARCHAR[]
+        ) as tags
+      FROM ebooks e
+      LEFT JOIN users u ON e.user_id = u.id
+      LEFT JOIN ebook_tag_relations etr ON e.id = etr.ebook_id
+      LEFT JOIN ebook_tags et ON etr.tag_id = et.id
+      WHERE e.slug = $1 AND e.published = true
+      GROUP BY e.id, u.display_name
+    `, [slug]);
+    
+    if (ebookResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Ebook not found' });
+    }
+    
+    const ebook = ebookResult.rows[0];
+    
+    // Increment view count (1 per user)
+    const authHeader = req.headers['authorization'];
+    let userId = null;
+    
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.userId;
+      } catch (err) {}
+    }
+    
+    if (userId) {
+      const viewCheck = await pool.query(
+        'SELECT id FROM ebook_views WHERE ebook_id = $1 AND user_id = $2',
+        [ebook.id, userId]
+      );
+      
+      if (viewCheck.rows.length === 0) {
+        await pool.query('INSERT INTO ebook_views (ebook_id, user_id) VALUES ($1, $2)', [ebook.id, userId]);
+        await pool.query('UPDATE ebooks SET views = views + 1 WHERE id = $1', [ebook.id]);
+        ebook.views += 1;
+      }
+    }
+    
+    res.json({ ebook });
+  } catch (error) {
+    console.error('Get ebook error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get ebook chapters
+app.get('/api/ebooks/:id/chapters', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT * FROM ebook_chapters
+      WHERE ebook_id = $1
+      ORDER BY chapter_number ASC
+    `, [id]);
+    
+    res.json({ chapters: result.rows });
+  } catch (error) {
+    console.error('Get chapters error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get single chapter
+app.get('/api/ebooks/:ebookId/chapters/:chapterId', async (req, res) => {
+  try {
+    const { ebookId, chapterId } = req.params;
+    
+    const result = await pool.query(`
+      SELECT * FROM ebook_chapters
+      WHERE ebook_id = $1 AND id = $2
+    `, [ebookId, chapterId]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Chapter not found' });
+    }
+    
+    res.json({ chapter: result.rows[0] });
+  } catch (error) {
+    console.error('Get chapter error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create ebook draft (authenticated)
+app.post('/api/ebooks', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      title, 
+      subtitle, 
+      description, 
+      cover_image,
+      terms_agreed,
+      public_domain_agreed,
+      license_type
+    } = req.body;
+    const userId = req.user.userId;
+    
+    // Validation
+    if (!title?.trim()) {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+    
+    if (!description?.trim()) {
+      return res.status(400).json({ error: 'Description is required' });
+    }
+    
+    if (!cover_image?.trim()) {
+      return res.status(400).json({ error: 'Cover image is required' });
+    }
+    
+    if (terms_agreed !== true) {
+      return res.status(400).json({ error: 'You must agree to the terms' });
+    }
+    
+    if (public_domain_agreed !== true) {
+      return res.status(400).json({ error: 'You must confirm this is public domain' });
+    }
+    
+    // Get user's display name for author
+    const userResult = await pool.query('SELECT display_name FROM users WHERE id = $1', [userId]);
+    const authorName = userResult.rows[0].display_name;
+    
+    // Generate slug
+    const slugResult = await pool.query(
+      'SELECT generate_ebook_slug($1, $2) as slug',
+      [title, authorName]
+    );
+    const slug = slugResult.rows[0].slug;
+    
+    // Create ebook
+    const result = await pool.query(`
+      INSERT INTO ebooks (
+        user_id, title, subtitle, description, author_name, 
+        cover_image, license_type, slug, published
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)
+      RETURNING *
+    `, [userId, title.trim(), subtitle?.trim(), description.trim(), authorName, cover_image, license_type, slug]);
+    
+    res.status(201).json({
+      message: 'Ebook draft created successfully',
+      ebook: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Create ebook error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get user's ebooks (drafts and published)
+app.get('/api/user/ebooks', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const result = await pool.query(`
+      SELECT 
+        e.*,
+        COALESCE(
+          ARRAY_AGG(et.name ORDER BY et.name) FILTER (WHERE et.name IS NOT NULL),
+          ARRAY[]::VARCHAR[]
+        ) as tags,
+        (SELECT COUNT(*) FROM ebook_chapters WHERE ebook_id = e.id) as chapter_count
+      FROM ebooks e
+      LEFT JOIN ebook_tag_relations etr ON e.id = etr.ebook_id
+      LEFT JOIN ebook_tags et ON etr.tag_id = et.id
+      WHERE e.user_id = $1
+      GROUP BY e.id
+      ORDER BY e.updated_at DESC
+    `, [userId]);
+    
+    res.json({ ebooks: result.rows });
+  } catch (error) {
+    console.error('Get user ebooks error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update ebook
+app.put('/api/ebooks/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { 
+      description, 
+      subtitle, 
+      cover_image,
+      license_type
+    } = req.body;
+    const userId = req.user.userId;
+    
+    // Check ownership
+    const ownerCheck = await pool.query(
+      'SELECT user_id FROM ebooks WHERE id = $1',
+      [id]
+    );
+    
+    if (ownerCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Ebook not found' });
+    }
+    
+    if (ownerCheck.rows[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    
+    // Update ebook (title cannot be changed)
+    const result = await pool.query(`
+      UPDATE ebooks
+      SET description = $1, subtitle = $2, cover_image = $3, 
+          license_type = $4, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $5
+      RETURNING *
+    `, [description, subtitle, cover_image, license_type, id]);
+    
+    res.json({
+      message: 'Ebook updated successfully',
+      ebook: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Update ebook error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Save/Update chapter (autosave)
+app.post('/api/ebooks/:id/chapters', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { chapter_number, chapter_title, content, page_count } = req.body;
+    const userId = req.user.userId;
+    
+    // Check ownership
+    const ownerCheck = await pool.query(
+      'SELECT user_id FROM ebooks WHERE id = $1',
+      [id]
+    );
+    
+    if (ownerCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Ebook not found' });
+    }
+    
+    if (ownerCheck.rows[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    
+    // Upsert chapter
+    const result = await pool.query(`
+      INSERT INTO ebook_chapters (ebook_id, chapter_number, chapter_title, content, page_count)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (ebook_id, chapter_number)
+      DO UPDATE SET 
+        chapter_title = EXCLUDED.chapter_title,
+        content = EXCLUDED.content,
+        page_count = EXCLUDED.page_count,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING *
+    `, [id, chapter_number, chapter_title, content, page_count]);
+    
+    res.json({
+      message: 'Chapter saved successfully',
+      chapter: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Save chapter error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete chapter
+app.delete('/api/ebooks/:ebookId/chapters/:chapterId', authenticateToken, async (req, res) => {
+  try {
+    const { ebookId, chapterId } = req.params;
+    const userId = req.user.userId;
+    
+    // Check ownership
+    const ownerCheck = await pool.query(
+      'SELECT user_id FROM ebooks WHERE id = $1',
+      [ebookId]
+    );
+    
+    if (ownerCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Ebook not found' });
+    }
+    
+    if (ownerCheck.rows[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    
+    // Check if this is the last chapter
+    const chapterCount = await pool.query(
+      'SELECT COUNT(*) as count FROM ebook_chapters WHERE ebook_id = $1',
+      [ebookId]
+    );
+    
+    if (parseInt(chapterCount.rows[0].count) <= 1) {
+      return res.status(400).json({ error: 'Cannot delete the last chapter' });
+    }
+    
+    await pool.query('DELETE FROM ebook_chapters WHERE id = $1', [chapterId]);
+    
+    res.json({ message: 'Chapter deleted successfully' });
+  } catch (error) {
+    console.error('Delete chapter error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Publish ebook
+app.post('/api/ebooks/:id/publish', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tagIds = [] } = req.body;
+    const userId = req.user.userId;
+    
+    // Check ownership
+    const ebookCheck = await pool.query(
+      'SELECT * FROM ebooks WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+    
+    if (ebookCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Ebook not found' });
+    }
+    
+    const ebook = ebookCheck.rows[0];
+    
+    // Check if already published
+    if (ebook.published) {
+      return res.status(400).json({ error: 'Ebook is already published' });
+    }
+    
+    // Check page count requirement
+    if (ebook.page_count < 30) {
+      return res.status(400).json({ 
+        error: `Your ebook must have at least 30 pages to publish. Current pages: ${ebook.page_count}` 
+      });
+    }
+    
+    // Check weekly limit (2 books per week)
+    const weeklyCheck = await pool.query(`
+      SELECT COUNT(*) as count
+      FROM ebooks
+      WHERE user_id = $1 
+        AND published = true
+        AND published_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+    `, [userId]);
+    
+    const weeklyCount = parseInt(weeklyCheck.rows[0].count);
+    if (weeklyCount >= 2) {
+      return res.status(400).json({ 
+        error: 'You have reached your weekly limit of 2 published ebooks. Please wait before publishing more.' 
+      });
+    }
+    
+    // Validate tags (max 5)
+    if (tagIds.length > 5) {
+      return res.status(400).json({ error: 'You can select a maximum of 5 tags' });
+    }
+    
+    // Publish ebook
+    await pool.query(`
+      UPDATE ebooks
+      SET published = true, published_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+    `, [id]);
+    
+    // Add tags
+    if (tagIds.length > 0) {
+      const tagValues = tagIds.map(tagId => `(${id}, ${tagId})`).join(', ');
+      await pool.query(`
+        INSERT INTO ebook_tag_relations (ebook_id, tag_id)
+        VALUES ${tagValues}
+        ON CONFLICT DO NOTHING
+      `);
+    }
+    
+    // Award points
+    await awardPoints(userId, 'ebook_published', 15, parseInt(id), 'ebook');
+    
+    res.json({ message: 'Ebook published successfully!' });
+  } catch (error) {
+    console.error('Publish ebook error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Save reading progress
+app.post('/api/ebooks/:id/progress', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { chapter_id, page_number, progress_percentage } = req.body;
+    const userId = req.user.userId;
+    
+    await pool.query(`
+      INSERT INTO reading_progress (user_id, ebook_id, chapter_id, page_number, progress_percentage, last_read_at)
+      VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+      ON CONFLICT (user_id, ebook_id)
+      DO UPDATE SET 
+        chapter_id = EXCLUDED.chapter_id,
+        page_number = EXCLUDED.page_number,
+        progress_percentage = EXCLUDED.progress_percentage,
+        last_read_at = CURRENT_TIMESTAMP
+    `, [userId, id, chapter_id, page_number, progress_percentage]);
+    
+    res.json({ message: 'Progress saved' });
+  } catch (error) {
+    console.error('Save progress error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get reading progress
+app.get('/api/ebooks/:id/progress', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    
+    const result = await pool.query(`
+      SELECT * FROM reading_progress
+      WHERE user_id = $1 AND ebook_id = $2
+    `, [userId, id]);
+    
+    res.json({ progress: result.rows[0] || null });
+  } catch (error) {
+    console.error('Get progress error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get continue reading list
+app.get('/api/user/continue-reading', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const result = await pool.query(`
+      SELECT 
+        e.*,
+        rp.chapter_id,
+        rp.page_number,
+        rp.progress_percentage,
+        rp.last_read_at,
+        ec.chapter_title,
+        COALESCE(
+          ARRAY_AGG(et.name ORDER BY et.name) FILTER (WHERE et.name IS NOT NULL),
+          ARRAY[]::VARCHAR[]
+        ) as tags
+      FROM reading_progress rp
+      JOIN ebooks e ON rp.ebook_id = e.id
+      LEFT JOIN ebook_chapters ec ON rp.chapter_id = ec.id
+      LEFT JOIN ebook_tag_relations etr ON e.id = etr.ebook_id
+      LEFT JOIN ebook_tags et ON etr.tag_id = et.id
+      WHERE rp.user_id = $1 AND e.published = true
+      GROUP BY e.id, rp.chapter_id, rp.page_number, rp.progress_percentage, rp.last_read_at, ec.chapter_title
+      ORDER BY rp.last_read_at DESC
+      LIMIT 10
+    `, [userId]);
+    
+    res.json({ books: result.rows });
+  } catch (error) {
+    console.error('Get continue reading error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Save highlight
+app.post('/api/ebooks/:id/highlights', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { 
+      chapter_id, 
+      highlight_text, 
+      highlight_color, 
+      start_offset, 
+      end_offset,
+      note,
+      tags 
+    } = req.body;
+    const userId = req.user.userId;
+    
+    const result = await pool.query(`
+      INSERT INTO ebook_highlights (
+        user_id, ebook_id, chapter_id, highlight_text, 
+        highlight_color, start_offset, end_offset, note, tags
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *
+    `, [userId, id, chapter_id, highlight_text, highlight_color, start_offset, end_offset, note, tags]);
+    
+    res.json({ highlight: result.rows[0] });
+  } catch (error) {
+    console.error('Save highlight error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get highlights for a chapter
+app.get('/api/ebooks/:ebookId/chapters/:chapterId/highlights', authenticateToken, async (req, res) => {
+  try {
+    const { ebookId, chapterId } = req.params;
+    const userId = req.user.userId;
+    
+    const result = await pool.query(`
+      SELECT * FROM ebook_highlights
+      WHERE user_id = $1 AND ebook_id = $2 AND chapter_id = $3
+      ORDER BY start_offset ASC
+    `, [userId, ebookId, chapterId]);
+    
+    res.json({ highlights: result.rows });
+  } catch (error) {
+    console.error('Get highlights error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete highlight
+app.delete('/api/highlights/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    
+    const result = await pool.query(
+      'DELETE FROM ebook_highlights WHERE id = $1 AND user_id = $2 RETURNING id',
+      [id, userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Highlight not found' });
+    }
+    
+    res.json({ message: 'Highlight deleted' });
+  } catch (error) {
+    console.error('Delete highlight error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete ebook
+app.delete('/api/ebooks/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    // Check if user owns the ebook
+    const ownerCheck = await pool.query(
+      'SELECT user_id FROM ebooks WHERE id = $1',
+      [id]
+    );
+
+    if (ownerCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Ebook not found' });
+    }
+
+    if (ownerCheck.rows[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Not authorized to delete this ebook' });
+    }
+
+    // Start a transaction to ensure all related data is deleted properly
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      
+      // Delete related data first (due to foreign key constraints)
+      await client.query('DELETE FROM ebook_highlights WHERE ebook_id = $1', [id]);
+      await client.query('DELETE FROM reading_progress WHERE ebook_id = $1', [id]);
+      await client.query('DELETE FROM ebook_views WHERE ebook_id = $1', [id]);
+      await client.query('DELETE FROM ebook_tag_relations WHERE ebook_id = $1', [id]);
+      await client.query('DELETE FROM ebook_chapters WHERE ebook_id = $1', [id]);
+      
+      // Finally delete the ebook
+      await client.query('DELETE FROM ebooks WHERE id = $1', [id]);
+      
+      await client.query('COMMIT');
+      
+      res.json({ message: 'Ebook deleted successfully' });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Delete ebook error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 
 // Add this catch-all route at very end, before error handling middleware
 // This serves the React app for any route that doesn't match API routes
